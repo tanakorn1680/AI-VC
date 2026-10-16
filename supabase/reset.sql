@@ -1,4 +1,11 @@
 -- reset.sql — ลบทุกอย่างที่ schema.sql สร้าง เพื่อรันใหม่ (ข้อมูลทั้งหมดจะหาย!)
+-- ของ migration 0005 (Reverse Engineering Mode) — ลบก่อนเพราะไม่ขึ้นกับตารางอื่นนอกจาก profiles
+drop table    if exists public.analysis_reports, public.analysis_evidence, public.analysis_findings,
+                        public.analysis_artifacts, public.analysis_tool_runs, public.analysis_tasks,
+                        public.analysis_sessions cascade;
+drop function if exists public.is_analysis_owner(uuid),
+                        public.guard_analysis_session_status(),
+                        public.analysis_touch_updated_at() cascade;
 drop view     if exists public.api_credentials_safe;
 drop table    if exists public.usage, public.model_prices, public.file_versions, public.files,
                         public.messages, public.task_results, public.tasks, public.agents,

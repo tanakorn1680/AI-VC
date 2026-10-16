@@ -123,6 +123,24 @@ insert into public.model_prices (provider, model, in_per_mtok, out_per_mtok) val
 
 ---
 
+## Reverse Engineering Mode (ระยะ 01: Foundation)
+
+โหมดวิเคราะห์ซอฟต์แวร์ที่แยกจาก Project Mode (หน้า `/reverse-engineering`, API `/api/analysis`)
+
+**ทำงานได้จริงแล้ว:** สร้างงานวิเคราะห์ (ชื่อ เป้าหมาย ประเภทเป้าหมายที่ระบุ) · แก้ไข · ยกเลิก · ลบ · โหลดกลับมา · เจ้าของข้อมูลเท่านั้นที่เข้าถึงได้
+
+**ยังไม่มี (ระยะถัดไป):** การนำเข้าไฟล์ · Tool Registry / Analysis Worker · AI Orchestration · รายงานและการส่งต่อไป Project Mode
+หน้าจอที่ยังไม่มีข้อมูลจริง (Call Graph, Evidence, Agents & Tools, Report) จะแสดงสถานะ "ยังไม่พร้อม" ไม่แสดงข้อมูลตัวอย่าง
+
+วิธีเปิดใช้:
+1. Supabase → SQL Editor → รัน `supabase/migrations/0005_analysis_foundation.sql` (รันซ้ำได้)
+2. (ไม่บังคับ) รัน `supabase/tests/analysis_rls_test.sql` ได้ `ALL ANALYSIS RLS TESTS PASSED` และ rollback ไม่ทิ้งข้อมูล
+3. Deploy ตามปกติ — ไม่มี env var เพิ่ม
+
+สิทธิ์: ผู้ใช้เขียนได้เฉพาะตาราง `analysis_sessions` (และแก้ได้เฉพาะชื่อ/เป้าหมาย/ยกเลิก) ส่วนตารางอื่น
+(`analysis_tasks`, `analysis_tool_runs`, `analysis_artifacts`, `analysis_findings`, `analysis_evidence`, `analysis_reports`)
+เขียนได้เฉพาะ service role ฝั่ง server เพื่อไม่ให้ปลอมผลวิเคราะห์หรือหลักฐานได้
+
 ## สิ่งที่ยังไม่ได้ตรวจ (สำคัญ — อ่านก่อนใช้งานจริง)
 
 sandbox ที่ใช้เขียนโค้ดนี้**ไม่มีเครือข่าย** จึงทำสิ่งต่อไปนี้ไม่ได้:
