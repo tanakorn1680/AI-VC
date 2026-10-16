@@ -60,10 +60,21 @@ export interface AnalysisSession {
   status: SessionStatus
   created_at: string
   updated_at: string
+  analyst_agent_id: string | null
+  token_budget: number
+  tokens_in: number
+  tokens_out: number
+  cost_usd: number
+  last_error: string | null
 }
 
-// คอลัมน์ที่ส่งให้ client (ไม่รวม owner_id / config)
-export const SESSION_COLUMNS = 'id, title, goal, target_kind, status, created_at, updated_at'
+// คอลัมน์ที่ส่งให้ client (ไม่รวม owner_id / config / step_lock_until)
+export const SESSION_COLUMNS =
+  'id, title, goal, target_kind, status, created_at, updated_at, analyst_agent_id, token_budget, tokens_in, tokens_out, cost_usd, last_error'
+
+export const TOKEN_BUDGET_MIN = 10_000
+export const TOKEN_BUDGET_MAX = 2_000_000
+export const TOKEN_BUDGET_DEFAULT = 200_000
 
 /** จำนวนข้อมูลลูกของงานหนึ่ง ๆ — ใช้แสดงความคืบหน้าจริงในหน้ารายละเอียด */
 export interface AnalysisCounts {
@@ -99,3 +110,34 @@ export interface AnalysisArtifact {
 }
 
 export const ARTIFACT_COLUMNS = 'id, kind, name, size_bytes, sha256, metadata, produced_by_run_id, created_at'
+
+export const TASK_STATUS_LABELS: Record<string, string> = {
+  pending: 'รอคิว',
+  running: 'กำลังทำ',
+  completed: 'เสร็จ',
+  failed: 'ล้มเหลว',
+  cancelled: 'ยกเลิก',
+}
+
+export interface AnalysisTask {
+  id: string
+  title: string
+  description: string
+  success_criteria: string
+  status: string
+  depends_on: string[]
+  input: { tool_id?: string; artifact_id?: string }
+  error: string | null
+  attempts: number
+  created_at: string
+}
+
+export const TASK_COLUMNS =
+  'id, title, description, success_criteria, status, depends_on, input, error, attempts, created_at'
+
+export const CONFIDENCE_LABELS: Record<string, string> = {
+  unverified: 'ยังไม่ยืนยัน',
+  low: 'ต่ำ',
+  medium: 'ปานกลาง',
+  high: 'สูง',
+}

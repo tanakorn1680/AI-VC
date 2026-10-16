@@ -105,7 +105,9 @@ export default async function AnalysisDetailPage({
         })}
       </nav>
 
-      {tab === 'overview' && <OverviewPanel session={session} counts={await countChildren(supabase, id)} />}
+      {tab === 'overview' && (
+        <OverviewPanel session={session} counts={await countChildren(supabase, id)} supabase={supabase} />
+      )}
       {tab === 'artifacts' && <ArtifactsPanel supabase={supabase} sessionId={id} />}
       {tab === 'call-graph' && <CallGraphPanel />}
       {tab === 'evidence' && <EvidencePanel supabase={supabase} sessionId={id} />}

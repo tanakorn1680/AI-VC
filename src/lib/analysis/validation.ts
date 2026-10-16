@@ -1,6 +1,8 @@
-import { cleanChatText, isValidEnum, sanitizeShort } from '@/lib/utils/sanitize'
+import { cleanChatText, isValidEnum, isValidUUID, sanitizeShort } from '@/lib/utils/sanitize'
 import {
   GOAL_MAX,
+  TOKEN_BUDGET_MAX,
+  TOKEN_BUDGET_MIN,
   TARGET_KINDS,
   TITLE_MAX,
   type TargetKind,
@@ -50,6 +52,9 @@ export function parseCreateSession(body: unknown): Result<CreateSessionInput> {
 export interface UpdateSessionInput {
   title?: string
   goal?: string
+  /** agent ที่ใช้วิเคราะห์ (null = ล้างค่า) */
+  analyst_agent_id?: string | null
+  token_budget?: number
   /** ผู้ใช้เปลี่ยนสถานะได้อย่างเดียวคือยกเลิก */
   cancel?: true
 }
@@ -73,6 +78,24 @@ export function parseUpdateSession(body: unknown): Result<UpdateSessionInput> {
     out.goal = cleanChatText(rec.goal, GOAL_MAX)
   }
 
+  if (rec.analyst_agent_id !== undefined) {
+    if (rec.analyst_agent_id !== null && !isValidUUID(rec.analyst_agent_id)) {
+      return { ok: false, message: 'รหัส agent ไม่ถูกต้อง' }
+    }
+    out.analyst_agent_id = rec.analyst_agent_id
+  }
+
+  if (rec.token_budget !== undefined) {
+    const b = rec.token_budget
+    if (typeof b !== 'number' || !Number.isInteger(b) || b < TOKEN_BUDGET_MIN || b > TOKEN_BUDGET_MAX) {
+      return {
+        ok: false,
+        message: `งบ token ต้องเป็นจำนวนเต็มระหว่าง ${TOKEN_BUDGET_MIN.toLocaleString('en-US')} ถึง ${TOKEN_BUDGET_MAX.toLocaleString('en-US')}`,
+      }
+    }
+    out.token_budget = b
+  }
+
   if (rec.status !== undefined) {
     if (rec.status !== 'cancelled') {
       return { ok: false, message: 'เปลี่ยนสถานะได้เฉพาะการยกเลิกงาน' }
@@ -80,7 +103,10 @@ export function parseUpdateSession(body: unknown): Result<UpdateSessionInput> {
     out.cancel = true
   }
 
-  if (out.title === undefined && out.goal === undefined && !out.cancel) {
+  if (
+    out.title === undefined && out.goal === undefined && out.analyst_agent_id === undefined &&
+    out.token_budget === undefined && !out.cancel
+  ) {
     return { ok: false, message: 'ไม่มีข้อมูลที่ต้องแก้ไข' }
   }
   return { ok: true, value: out }

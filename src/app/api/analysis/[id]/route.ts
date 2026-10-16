@@ -45,7 +45,7 @@ export async function PATCH(req: Request, { params }: Ctx) {
   if (bodyErr) return bodyErr
   const parsed = parseUpdateSession(body)
   if (!parsed.ok) return apiError('BAD_REQUEST', parsed.message)
-  const { title, goal, cancel } = parsed.value
+  const { title, goal, cancel, analyst_agent_id, token_budget } = parsed.value
 
   const { data: current, error: readErr } = await auth.supabase
     .from('analysis_sessions')
@@ -62,9 +62,17 @@ export async function PATCH(req: Request, { params }: Ctx) {
     return apiError('BAD_REQUEST', 'งานนี้อยู่ในสถานะที่ยกเลิกไม่ได้')
   }
 
-  const patch: Record<string, string> = {}
+  // agent ต้องเป็นของผู้ใช้ (RLS ของ agents กรองให้เห็นเฉพาะ project ของตัวเอง) — server ตรวจซ้ำตอนใช้งานจริงอีกชั้น
+  if (analyst_agent_id) {
+    const { data: agent } = await auth.supabase.from('agents').select('id').eq('id', analyst_agent_id).maybeSingle()
+    if (!agent) return apiError('BAD_REQUEST', 'ไม่พบ agent ที่เลือก')
+  }
+
+  const patch: Record<string, string | number | null> = {}
   if (title !== undefined) patch.title = title
   if (goal !== undefined) patch.goal = goal
+  if (analyst_agent_id !== undefined) patch.analyst_agent_id = analyst_agent_id
+  if (token_budget !== undefined) patch.token_budget = token_budget
   if (cancel) patch.status = 'cancelled'
 
   let query = auth.supabase.from('analysis_sessions').update(patch).eq('id', id)

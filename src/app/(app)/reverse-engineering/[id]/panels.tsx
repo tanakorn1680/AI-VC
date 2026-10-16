@@ -11,8 +11,14 @@ import { getRegistry, supportsKind } from '@/lib/analysis/tool-registry'
 import {
   ARTIFACT_COLUMNS,
   ARTIFACT_KIND_LABELS,
+  CONFIDENCE_LABELS,
+  TASK_COLUMNS,
+  TASK_STATUS_LABELS,
   type AnalysisArtifact,
+  type AnalysisTask,
 } from '@/lib/analysis/types'
+import AnalystSettings, { type AgentOption } from './analyst-settings'
+import RunControls from './run-controls'
 import ArtifactUploader from './artifact-uploader'
 import RunToolButton from './run-tool-button'
 
@@ -26,19 +32,52 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
 
-const CONFIDENCE_LABELS: Record<string, string> = {
-  unverified: 'ยังไม่ยืนยัน',
-  low: 'ต่ำ',
-  medium: 'ปานกลาง',
-  high: 'สูง',
+const TASK_TONE: Record<string, string> = {
+  pending: 'border-neutral-700 bg-neutral-800/60 text-neutral-300',
+  running: 'border-sky-800/60 bg-sky-950/40 text-sky-300',
+  completed: 'border-emerald-800/60 bg-emerald-950/40 text-emerald-300',
+  failed: 'border-red-800/60 bg-red-950/40 text-red-300',
+  cancelled: 'border-neutral-800 bg-neutral-900 text-neutral-500',
 }
 
-export function OverviewPanel({ session, counts }: { session: AnalysisSession; counts: AnalysisCounts }) {
+async function loadAgentOptions(supabase: Db): Promise<AgentOption[]> {
+  // RLS ของ agents/projects กรองให้เห็นเฉพาะของผู้ใช้เอง
+  const [{ data: agents }, { data: projects }] = await Promise.all([
+    supabase.from('agents').select('id, name, provider, model, project_id').order('created_at', { ascending: false }).limit(100),
+    supabase.from('projects').select('id, name').limit(200),
+  ])
+  const names = new Map(((projects ?? []) as { id: string; name: string }[]).map((p) => [p.id, p.name]))
+  return ((agents ?? []) as { id: string; name: string; provider: string; model: string; project_id: string }[]).map((a) => ({
+    id: a.id,
+    name: a.name,
+    provider: a.provider,
+    model: a.model,
+    projectName: names.get(a.project_id) ?? '-',
+  }))
+}
+
+export async function OverviewPanel({
+  session,
+  counts,
+  supabase,
+}: {
+  session: AnalysisSession
+  counts: AnalysisCounts
+  supabase: Db
+}) {
+  const [agents, { data: taskData }] = await Promise.all([
+    loadAgentOptions(supabase),
+    supabase.from('analysis_tasks').select(TASK_COLUMNS).eq('session_id', session.id).order('created_at', { ascending: true }).limit(50),
+  ])
+  const tasks = (taskData ?? []) as unknown as AnalysisTask[]
+  const titleById = new Map(tasks.map((t) => [t.id, t.title]))
+  const locked = session.status === 'completed' || session.status === 'cancelled'
+  const used = session.tokens_in + session.tokens_out
   const stats: [string, number][] = [
     ['ขั้นตอน', counts.tasks],
     ['การเรียกเครื่องมือ', counts.tool_runs],
     ['Artifact', counts.artifacts],
-    ['ข้อค้นพบ', counts.findings],
+    ['ข้อค้นพบ/ข้อจำกัด', counts.findings],
     ['หลักฐาน', counts.evidence],
     ['รายงาน', counts.reports],
   ]
@@ -66,6 +105,65 @@ export function OverviewPanel({ session, counts }: { session: AnalysisSession; c
             <dd className="mt-0.5 text-neutral-200">{formatDateTime(session.updated_at)}</dd>
           </div>
         </dl>
+      </section>
+
+      <section className={`${CARD} space-y-4 p-4`}>
+        <h2 className="text-sm font-medium text-neutral-300">การวิเคราะห์ด้วย AI</h2>
+        <AnalystSettings
+          sessionId={session.id}
+          agents={agents}
+          agentId={session.analyst_agent_id}
+          tokenBudget={session.token_budget}
+          locked={locked}
+        />
+        <div className="border-t border-neutral-800 pt-4">
+          <RunControls
+            sessionId={session.id}
+            status={session.status}
+            label={tasks.length === 0 ? 'เริ่มวิเคราะห์' : 'ทำต่อ'}
+          />
+          {session.last_error && (
+            <p role="alert" className="mt-3 rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+              {session.last_error}
+            </p>
+          )}
+          <p className="mt-3 text-xs text-neutral-500">
+            ใช้ token แล้ว {used.toLocaleString('en-US')} / {session.token_budget.toLocaleString('en-US')}
+            {Number(session.cost_usd) > 0 && ` · ประมาณ $${Number(session.cost_usd).toFixed(4)}`}
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2 className="mb-2 text-sm font-medium text-neutral-300">แผนการวิเคราะห์</h2>
+        {tasks.length === 0 ? (
+          <EmptyState title="ยังไม่มีแผน">
+            เลือก agent อัปโหลดไฟล์ที่แท็บ Artifacts แล้วกดเริ่มวิเคราะห์ AI จะวางแผนโดยเลือกจากเครื่องมือที่พร้อมใช้งานจริงเท่านั้น
+          </EmptyState>
+        ) : (
+          <ul className={`${CARD} divide-y divide-neutral-800`}>
+            {tasks.map((t, i) => (
+              <li key={t.id} className="px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm text-neutral-200">
+                    <span className="mr-2 text-xs text-neutral-500">{i + 1}.</span>
+                    {t.title}
+                  </p>
+                  <span className={`shrink-0 rounded-full border px-2.5 py-0.5 text-xs ${TASK_TONE[t.status] ?? TASK_TONE.pending}`}>
+                    {TASK_STATUS_LABELS[t.status] ?? t.status}
+                  </span>
+                </div>
+                {t.description && <p className="mt-1 text-xs text-neutral-400">{t.description}</p>}
+                <p className="mt-1 text-xs text-neutral-500">
+                  เครื่องมือ: {t.input.tool_id ?? '-'}
+                  {t.depends_on.length > 0 && ` · ต้องรอ: ${t.depends_on.map((d) => titleById.get(d) ?? '-').join(', ')}`}
+                </p>
+                {t.success_criteria && <p className="mt-0.5 text-xs text-neutral-500">เงื่อนไขสำเร็จ: {t.success_criteria}</p>}
+                {t.error && <p className="mt-1 text-xs text-red-400">{t.error}</p>}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section>
@@ -193,48 +291,95 @@ export async function EvidencePanel({ supabase, sessionId }: { supabase: Db; ses
   const [{ data: findingData }, { data: evidenceData }] = await Promise.all([
     supabase
       .from('analysis_findings')
-      .select('id, title, statement, confidence, created_at')
+      .select('id, kind, title, statement, confidence, created_at')
       .eq('session_id', sessionId)
-      .order('created_at', { ascending: false })
+      .order('created_at', { ascending: true })
       .limit(200),
-    supabase.from('analysis_evidence').select('finding_id').eq('session_id', sessionId).limit(2000),
+    supabase
+      .from('analysis_evidence')
+      .select('id, finding_id, artifact_id, locator, excerpt')
+      .eq('session_id', sessionId)
+      .limit(2000),
   ])
-  const findings = (findingData ?? []) as {
-    id: string; title: string; statement: string; confidence: string
-  }[]
-  const evidenceCount = new Map<string, number>()
-  for (const e of (evidenceData ?? []) as { finding_id: string }[]) {
-    evidenceCount.set(e.finding_id, (evidenceCount.get(e.finding_id) ?? 0) + 1)
+  const rows = (findingData ?? []) as { id: string; kind: string; title: string; statement: string; confidence: string }[]
+  const findings = rows.filter((r) => r.kind === 'finding')
+  const limitations = rows.filter((r) => r.kind === 'limitation')
+  const evidenceByFinding = new Map<string, { id: string; artifact_id: string | null; locator: string; excerpt: string }[]>()
+  for (const e of (evidenceData ?? []) as { id: string; finding_id: string; artifact_id: string | null; locator: string; excerpt: string }[]) {
+    const list = evidenceByFinding.get(e.finding_id) ?? []
+    list.push(e)
+    evidenceByFinding.set(e.finding_id, list)
   }
 
-  if (findings.length === 0) {
+  if (rows.length === 0) {
     return (
       <EmptyState title="ยังไม่มีข้อค้นพบหรือหลักฐาน">
-        ข้อค้นพบจะปรากฏหลังเครื่องมือวิเคราะห์สร้างผลลัพธ์ พร้อมระดับความเชื่อมั่นและหลักฐานอ้างอิง
-        ซึ่งยังไม่เปิดใช้ในระยะนี้
+        ข้อค้นพบจะปรากฏหลัง AI สรุปผลจากเครื่องมือ ทุกข้อต้องอ้างหลักฐานที่ระบบตรวจแล้วว่ามีอยู่จริงในผลของเครื่องมือ
       </EmptyState>
     )
   }
   return (
-    <ul className={`${CARD} divide-y divide-neutral-800`}>
-      {findings.map((f) => {
-        const n = evidenceCount.get(f.id) ?? 0
-        return (
-          <li key={f.id} className="px-4 py-3">
-            <div className="flex items-start justify-between gap-3">
-              <p className="text-sm text-neutral-200">{f.title}</p>
-              <span className="shrink-0 text-xs text-neutral-400">
-                ความเชื่อมั่น: {CONFIDENCE_LABELS[f.confidence] ?? f.confidence}
-              </span>
-            </div>
-            {f.statement && <p className="mt-1 text-sm text-neutral-400">{f.statement}</p>}
-            <p className={`mt-1.5 text-xs ${n === 0 ? 'text-amber-400' : 'text-neutral-500'}`}>
-              {n === 0 ? 'ยังไม่มีหลักฐานรองรับ' : `หลักฐานอ้างอิง ${n} รายการ`}
-            </p>
-          </li>
-        )
-      })}
-    </ul>
+    <div className="space-y-6">
+      <p className="text-xs text-neutral-500">
+        ระดับความเชื่อมั่นคำนวณโดยระบบจากหลักฐานที่ตรวจผ่านแล้ว ไม่ใช่ค่าที่ AI ประเมินเอง
+        (ไม่มีหลักฐาน = ยังไม่ยืนยัน · 1 รายการ = ต่ำ · 2 รายการขึ้นไป = ปานกลาง · 3 รายการจากหลาย run = สูง)
+      </p>
+
+      {findings.length > 0 && (
+        <ul className={`${CARD} divide-y divide-neutral-800`}>
+          {findings.map((f) => {
+            const ev = evidenceByFinding.get(f.id) ?? []
+            return (
+              <li key={f.id} className="px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm text-neutral-200">{f.title}</p>
+                  <span className="shrink-0 text-xs text-neutral-400">
+                    ความเชื่อมั่น: {CONFIDENCE_LABELS[f.confidence] ?? f.confidence}
+                  </span>
+                </div>
+                {f.statement && <p className="mt-1 text-sm text-neutral-400">{f.statement}</p>}
+                {ev.length === 0 ? (
+                  <p className="mt-1.5 text-xs text-amber-400">ยังไม่มีหลักฐานรองรับ</p>
+                ) : (
+                  <ul className="mt-2 space-y-1.5">
+                    {ev.map((e) => (
+                      <li key={e.id} className="rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2">
+                        {e.locator && <p className="text-xs text-neutral-500">ตำแหน่ง: {e.locator}</p>}
+                        <p className="mt-0.5 whitespace-pre-wrap break-all font-mono text-xs text-neutral-300">{e.excerpt}</p>
+                        {e.artifact_id && (
+                          <a
+                            href={`/api/analysis/${sessionId}/artifacts/${e.artifact_id}/content`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="mt-1 inline-block text-xs text-indigo-400 hover:text-indigo-300"
+                          >
+                            ดูผลลัพธ์ต้นทาง (JSON)
+                          </a>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
+      {limitations.length > 0 && (
+        <section>
+          <h2 className="mb-2 text-sm font-medium text-neutral-300">ข้อจำกัดและสิ่งที่ยังตรวจสอบไม่ได้</h2>
+          <ul className={`${CARD} divide-y divide-neutral-800`}>
+            {limitations.map((l) => (
+              <li key={l.id} className="px-4 py-3">
+                <p className="text-sm text-neutral-200">{l.title}</p>
+                {l.statement && <p className="mt-1 text-sm text-neutral-400">{l.statement}</p>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </div>
   )
 }
 

@@ -5,6 +5,6 @@
 export const PHASES = [
   { id: '01', name: 'โครงสร้างงานวิเคราะห์', detail: 'สร้างงาน บันทึกสถานะ และจำกัดสิทธิ์เจ้าของข้อมูล', ready: true },
   { id: '02', name: 'Tool Registry และการเรียกเครื่องมือ', detail: 'ตรวจเครื่องมือจริง นำเข้าไฟล์ และบันทึกผลการเรียก (Worker/MCP ภายนอกยังไม่เชื่อมต่อ)', ready: true },
-  { id: '03', name: 'AI Orchestration', detail: 'วางแผน เลือกเครื่องมือ และเก็บหลักฐานย้อนกลับได้', ready: false },
+  { id: '03', name: 'AI Orchestration', detail: 'AI วางแผน เลือกเครื่องมือจาก Registry ตรวจหลักฐาน และทำต่อจากสถานะเดิมได้', ready: true },
   { id: '04', name: 'รายงานและส่งต่อ Project Mode', detail: 'สร้างข้อกำหนดทางเทคนิคจากข้อค้นพบ', ready: false },
 ] as const

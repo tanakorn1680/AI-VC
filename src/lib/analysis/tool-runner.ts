@@ -27,6 +27,8 @@ export async function runTool(args: {
     storage_path: string
   }
   toolId: string
+  /** งานในแผนที่เรียกครั้งนี้ (ถ้ามี) — ผูกประวัติการรันเข้ากับ analysis_tasks */
+  taskId?: string
 }): Promise<RunOutcome> {
   const { sessionId, artifact, toolId } = args
 
@@ -59,6 +61,7 @@ export async function runTool(args: {
     .from('analysis_tool_runs')
     .insert({
       session_id: sessionId,
+      task_id: args.taskId ?? null,
       tool_id: entry.id,
       tool_version: entry.version,
       status: 'running',
