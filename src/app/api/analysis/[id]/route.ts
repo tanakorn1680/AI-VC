@@ -3,6 +3,7 @@ import { apiError, apiOk, parseBody } from '@/lib/utils/api'
 import { isValidUUID } from '@/lib/utils/sanitize'
 import { CANCELLABLE_STATUSES, SESSION_COLUMNS, type AnalysisSession } from '@/lib/analysis/types'
 import { countChildren } from '@/lib/analysis/queries'
+import { removeSessionObjects } from '@/lib/analysis/storage'
 import { parseUpdateSession } from '@/lib/analysis/validation'
 
 type Ctx = { params: Promise<{ id: string }> }
@@ -97,6 +98,13 @@ export async function DELETE(_req: Request, { params }: Ctx) {
     return apiError('INTERNAL_ERROR', 'ลบงานวิเคราะห์ไม่สำเร็จ')
   }
   if (!data || data.length === 0) return apiError('NOT_FOUND', NOT_FOUND_MSG)
+
+  // แถวใน DB ถูกลบ (cascade) แล้ว: ล้างไฟล์ในที่เก็บตาม ล้มเหลวไม่ทำให้การลบงานล้ม
+  try {
+    await removeSessionObjects(id)
+  } catch (e) {
+    console.error('[analysis] remove session objects failed:', (e as Error).message)
+  }
 
   return apiOk({ deleted: true })
 }

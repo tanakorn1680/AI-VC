@@ -77,3 +77,25 @@ export interface AnalysisCounts {
 
 export const TITLE_MAX = 200
 export const GOAL_MAX = 4000
+
+export const ARTIFACT_KINDS = ['source', 'tool_output', 'report_attachment'] as const
+export type ArtifactKind = (typeof ARTIFACT_KINDS)[number]
+
+export const ARTIFACT_KIND_LABELS: Record<ArtifactKind, string> = {
+  source: 'ไฟล์ต้นทาง',
+  tool_output: 'ผลจากเครื่องมือ',
+  report_attachment: 'ไฟล์แนบรายงาน',
+}
+
+export interface AnalysisArtifact {
+  id: string
+  kind: ArtifactKind
+  name: string
+  size_bytes: number
+  sha256: string
+  metadata: { detected_kind?: string; detected_label?: string; tool_id?: string }
+  produced_by_run_id: string | null
+  created_at: string
+}
+
+export const ARTIFACT_COLUMNS = 'id, kind, name, size_bytes, sha256, metadata, produced_by_run_id, created_at'
