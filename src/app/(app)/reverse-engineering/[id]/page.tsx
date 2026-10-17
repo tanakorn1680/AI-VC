@@ -112,7 +112,9 @@ export default async function AnalysisDetailPage({
       {tab === 'call-graph' && <CallGraphPanel />}
       {tab === 'evidence' && <EvidencePanel supabase={supabase} sessionId={id} />}
       {tab === 'tools' && <ToolsPanel supabase={supabase} sessionId={id} />}
-      {tab === 'report' && <ReportPanel supabase={supabase} sessionId={id} />}
+      {tab === 'report' && (
+        <ReportPanel supabase={supabase} sessionId={id} status={session.status} title={session.title} />
+      )}
     </div>
   )
 }

@@ -47,7 +47,7 @@ const LOCK_SECONDS = 90
 const STALE_TASK_MS = 3 * 60 * 1000
 const MAX_EXTRA_ROUNDS = 1
 
-interface SessionRow {
+export interface SessionRow {
   id: string
   owner_id: string
   goal: string
@@ -96,7 +96,27 @@ export async function advanceSession(sessionId: string, ownerId: string): Promis
   if (session.status === 'cancelled') return { state: 'blocked', message: 'งานนี้ถูกยกเลิกแล้ว' }
   if (session.status === 'completed') return { state: 'done', message: 'งานนี้วิเคราะห์เสร็จแล้ว' }
 
-  // lease กัน step ซ้อนกัน (เปิดหลายแท็บ / กดซ้ำ): ได้ lease เท่านั้นจึงทำต่อ
+  const leased = await withSessionLease(admin, sessionId, async () => {
+    try {
+      return await runStep(admin, session)
+    } catch (e) {
+      console.error('[analysis] step crashed:', (e as Error).message)
+      return { state: 'error', message: 'เกิดข้อผิดพลาดภายในระหว่างวิเคราะห์ กรุณาลองใหม่' } as StepOutcome
+    }
+  })
+  if (!leased.ok) return { state: 'busy', message: 'มี step อื่นของงานนี้กำลังทำงานอยู่' }
+  return leased.value
+}
+
+/**
+ * lease กันงานซ้อนกันบน session เดียว (เปิดหลายแท็บ / กดซ้ำ): ได้ lease เท่านั้นจึงทำต่อ
+ * lease หมดอายุเองใน LOCK_SECONDS กันค้างเมื่อ function ถูกตัดกลางทาง
+ */
+export async function withSessionLease<T>(
+  admin: SupabaseClient,
+  sessionId: string,
+  fn: () => Promise<T>
+): Promise<{ ok: true; value: T } | { ok: false }> {
   const nowIso = new Date().toISOString()
   const { data: leased } = await admin
     .from('analysis_sessions')
@@ -104,15 +124,10 @@ export async function advanceSession(sessionId: string, ownerId: string): Promis
     .eq('id', sessionId)
     .or(`step_lock_until.is.null,step_lock_until.lt.${nowIso}`)
     .select('id')
-  if (!leased || leased.length === 0) {
-    return { state: 'busy', message: 'มี step อื่นของงานนี้กำลังทำงานอยู่' }
-  }
+  if (!leased || leased.length === 0) return { ok: false }
 
   try {
-    return await runStep(admin, session)
-  } catch (e) {
-    console.error('[analysis] step crashed:', (e as Error).message)
-    return { state: 'error', message: 'เกิดข้อผิดพลาดภายในระหว่างวิเคราะห์ กรุณาลองใหม่' }
+    return { ok: true, value: await fn() }
   } finally {
     await admin.from('analysis_sessions').update({ step_lock_until: null }).eq('id', sessionId)
   }
@@ -206,16 +221,19 @@ async function runStep(admin: SupabaseClient, session: SessionRow): Promise<Step
 // ---------------------------------------------------------------------------
 // ตัวช่วยเรียกโมเดล: ตรวจงบ → เรียก → บันทึก token/ค่าใช้จ่าย → จัดการ error ของ provider
 // ---------------------------------------------------------------------------
-async function callModel(
+export async function callModel(
   admin: SupabaseClient,
   session: SessionRow,
   analyst: AnalystAgent,
-  prompt: { system: string; user: string; maxTokens: number }
+  prompt: { system: string; user: string; maxTokens: number },
+  opts: { keepStatus?: boolean } = {}
 ): Promise<{ ok: true; result: JsonCompletion } | { ok: false; outcome: StepOutcome }> {
   const used = session.tokens_in + session.tokens_out
   if (used >= session.token_budget) {
     const message = `ใช้ token ครบงบที่ตั้งไว้ (${used.toLocaleString('en-US')} / ${session.token_budget.toLocaleString('en-US')}) เพิ่มงบแล้วกดทำต่อได้`
-    await admin.from('analysis_sessions').update({ status: 'failed', last_error: message }).eq('id', session.id)
+    if (!opts.keepStatus) {
+      await admin.from('analysis_sessions').update({ status: 'failed', last_error: message }).eq('id', session.id)
+    }
     return { ok: false, outcome: { state: 'blocked', message } }
   }
 
@@ -241,7 +259,9 @@ async function callModel(
     }
     if (e instanceof InvalidApiKeyError || e instanceof InsufficientCreditError) {
       const message = (e as Error).message
-      await admin.from('analysis_sessions').update({ status: 'failed', last_error: message.slice(0, 1000) }).eq('id', session.id)
+      if (!opts.keepStatus) {
+        await admin.from('analysis_sessions').update({ status: 'failed', last_error: message.slice(0, 1000) }).eq('id', session.id)
+      }
       return { ok: false, outcome: { state: 'blocked', message } }
     }
     if (e instanceof RateLimitError) {

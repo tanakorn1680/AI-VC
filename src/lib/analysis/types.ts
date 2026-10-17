@@ -141,3 +141,31 @@ export const CONFIDENCE_LABELS: Record<string, string> = {
   medium: 'ปานกลาง',
   high: 'สูง',
 }
+
+export const REPORT_KINDS = ['report', 'specification'] as const
+export type ReportKind = (typeof REPORT_KINDS)[number]
+
+export const REPORT_KIND_LABELS: Record<ReportKind, string> = {
+  report: 'รายงานผลวิเคราะห์',
+  specification: 'ข้อกำหนดทางเทคนิค',
+}
+
+export interface HandoffRecord {
+  project_id: string
+  at: string
+  mode: 'new' | 'existing'
+  files: string[]
+}
+
+export interface AnalysisReport {
+  id: string
+  kind: ReportKind
+  version: number
+  status: string
+  content: string
+  meta: Record<string, unknown>
+  handoffs: HandoffRecord[]
+  created_at: string
+}
+
+export const REPORT_COLUMNS = 'id, kind, version, status, content, meta, handoffs, created_at'

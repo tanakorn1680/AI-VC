@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import EmptyState from '../components/empty-state'
 import { formatDateTime } from '@/lib/analysis/format'
@@ -12,14 +13,21 @@ import {
   ARTIFACT_COLUMNS,
   ARTIFACT_KIND_LABELS,
   CONFIDENCE_LABELS,
+  REPORT_COLUMNS,
+  REPORT_KIND_LABELS,
   TASK_COLUMNS,
   TASK_STATUS_LABELS,
   type AnalysisArtifact,
+  type AnalysisReport,
   type AnalysisTask,
 } from '@/lib/analysis/types'
 import AnalystSettings, { type AgentOption } from './analyst-settings'
 import RunControls from './run-controls'
 import ArtifactUploader from './artifact-uploader'
+import { CreateDocButton, DownloadButton } from './report-actions'
+import HandoffForm from './handoff-form'
+import { loadSnapshot } from '@/lib/analysis/report'
+import { verifyTraceability, type SpecMeta } from '@/lib/analysis/spec'
 import RunToolButton from './run-tool-button'
 
 type Db = SupabaseClient
@@ -500,36 +508,146 @@ export async function ToolsPanel({ supabase, sessionId }: { supabase: Db; sessio
   )
 }
 
-export async function ReportPanel({ supabase, sessionId }: { supabase: Db; sessionId: string }) {
-  const { data } = await supabase
-    .from('analysis_reports')
-    .select('id, version, status, content, created_at')
-    .eq('session_id', sessionId)
-    .order('version', { ascending: false })
-    .limit(20)
-  const reports = (data ?? []) as {
-    id: string; version: number; status: string; content: string; created_at: string
-  }[]
-  const latest = reports[0]
-
-  if (!latest) {
-    return (
-      <EmptyState title="ยังไม่มีรายงาน">
-        รายงานจะสร้างจากข้อค้นพบที่มีหลักฐานรองรับ โดยสรุปสิ่งที่พิสูจน์ได้ ข้อจำกัด และสิ่งที่ยังไม่ทราบ
-      </EmptyState>
-    )
-  }
+function DocCard({ report, sessionId, children }: { report: AnalysisReport; sessionId: string; children?: React.ReactNode }) {
   return (
-    <div className="space-y-3">
-      <div className={`${CARD} p-4`}>
-        <p className="mb-2 text-xs text-neutral-500">
-          เวอร์ชัน {latest.version} · {latest.status === 'final' ? 'ฉบับสมบูรณ์' : 'ฉบับร่าง'} ·{' '}
-          {formatDateTime(latest.created_at)}
+    <div className={`${CARD} p-4`}>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-sm font-medium text-neutral-200">
+          {REPORT_KIND_LABELS[report.kind]} · เวอร์ชัน {report.version}
+          <span className="ml-2 text-xs font-normal text-neutral-500">{formatDateTime(report.created_at)}</span>
         </p>
-        <div className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-200">{latest.content}</div>
+        <DownloadButton
+          content={report.content}
+          filename={`${report.kind === 'report' ? 'analysis-report' : 'technical-specification'}-${sessionId.slice(0, 8)}-v${report.version}.md`}
+        />
       </div>
-      {reports.length > 1 && (
-        <p className="text-xs text-neutral-500">มีรายงานเวอร์ชันก่อนหน้า {reports.length - 1} ฉบับ</p>
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-neutral-800 bg-neutral-950/60 p-3 font-sans text-xs leading-relaxed text-neutral-300">
+        {report.content}
+      </pre>
+      {children}
+    </div>
+  )
+}
+
+export async function ReportPanel({
+  supabase,
+  sessionId,
+  status,
+  title,
+}: {
+  supabase: Db
+  sessionId: string
+  status: string
+  title: string
+}) {
+  const [{ data: reportData }, { data: projectData }, snap] = await Promise.all([
+    supabase
+      .from('analysis_reports')
+      .select(REPORT_COLUMNS)
+      .eq('session_id', sessionId)
+      .order('version', { ascending: false })
+      .limit(40),
+    supabase.from('projects').select('id, name').order('created_at', { ascending: false }).limit(100),
+    loadSnapshot(supabase, sessionId),
+  ])
+  const reports = (reportData ?? []) as unknown as AnalysisReport[]
+  const projects = (projectData ?? []) as { id: string; name: string }[]
+  const latestReport = reports.find((r) => r.kind === 'report')
+  const latestSpec = reports.find((r) => r.kind === 'specification')
+  const completed = status === 'completed'
+
+  // ตรวจย้อนกลับ ณ ตอนนี้ (ผลวิเคราะห์อาจถูกเปลี่ยนหลังสร้างสเปก)
+  const trace = latestSpec && snap ? verifyTraceability(latestSpec.meta as unknown as SpecMeta, snap) : null
+  const projectNames = new Map(projects.map((p) => [p.id, p.name]))
+
+  return (
+    <div className="space-y-6">
+      <section className={`${CARD} space-y-4 p-4`}>
+        <h2 className="text-sm font-medium text-neutral-300">สร้างเอกสาร</h2>
+        {!completed && (
+          <p className="text-xs text-amber-400">สร้างได้เมื่อวิเคราะห์เสร็จแล้ว (สถานะ "เสร็จสิ้น") — ไปที่แท็บ Overview เพื่อเริ่มหรือทำต่อ</p>
+        )}
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <CreateDocButton sessionId={sessionId} kind="report" label="สร้างรายงานผลวิเคราะห์" disabled={!completed} />
+            <p className="text-xs text-neutral-500">
+              ประกอบจากข้อมูลจริงเท่านั้น (ไฟล์ + hash, เครื่องมือ, ข้อค้นพบ + หลักฐาน, ข้อจำกัด) ไม่ใช้ AI เขียนเนื้อหา
+            </p>
+          </div>
+          <div className="space-y-2">
+            <CreateDocButton sessionId={sessionId} kind="specification" label="สร้างข้อกำหนดทางเทคนิค" disabled={!completed} />
+            <p className="text-xs text-neutral-500">
+              AI แปลงข้อค้นพบที่มีหลักฐานเป็นข้อกำหนดและเกณฑ์ทดสอบ ระบบตัดข้อที่อ้างหลักฐานไม่ได้ทิ้ง (ใช้ token ตามงบของงานนี้)
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {!latestReport && !latestSpec && (
+        <EmptyState title="ยังไม่มีรายงานหรือข้อกำหนด">
+          เมื่อวิเคราะห์เสร็จ สร้างรายงานเพื่อสรุปสิ่งที่พิสูจน์ได้ ข้อจำกัด และสิ่งที่ยังไม่ทราบ
+          แล้วสร้างข้อกำหนดเพื่อส่งต่อไปสร้างระบบใหม่ใน Project Mode
+        </EmptyState>
+      )}
+
+      {latestReport && <DocCard report={latestReport} sessionId={sessionId} />}
+
+      {latestSpec && (
+        <DocCard report={latestSpec} sessionId={sessionId}>
+          <div className="mt-4 space-y-4 border-t border-neutral-800 pt-4">
+            <div>
+              <h3 className="mb-1 text-sm font-medium text-neutral-300">การตรวจย้อนกลับไปหาหลักฐาน</h3>
+              {trace?.ok ? (
+                <p className="text-xs text-emerald-400">
+                  ทุกข้อกำหนดย้อนกลับไปหาข้อค้นพบที่มีหลักฐานได้ครบ ณ ตอนนี้
+                </p>
+              ) : (
+                <ul className="space-y-0.5 text-xs text-amber-400">
+                  {(trace?.problems ?? ['ตรวจไม่ได้']).map((p) => <li key={p}>{p}</li>)}
+                  <li className="text-neutral-500">สร้างข้อกำหนดเวอร์ชันใหม่เพื่อให้ตรงกับผลวิเคราะห์ปัจจุบัน</li>
+                </ul>
+              )}
+            </div>
+
+            <div>
+              <h3 className="mb-2 text-sm font-medium text-neutral-300">ส่งต่อไป Project Mode</h3>
+              <HandoffForm
+                sessionId={sessionId}
+                reportId={latestSpec.id}
+                defaultName={`${title} — ระบบใหม่`.slice(0, 200)}
+                projects={projects}
+                blockedReason={trace?.ok ? null : (trace?.problems[0] ?? 'ตรวจย้อนกลับไม่ได้')}
+              />
+            </div>
+
+            {latestSpec.handoffs.length > 0 && (
+              <div>
+                <h3 className="mb-1 text-sm font-medium text-neutral-300">ประวัติการส่งต่อของเวอร์ชันนี้</h3>
+                <ul className="space-y-1 text-xs text-neutral-400">
+                  {[...latestSpec.handoffs].reverse().map((h) => (
+                    <li key={`${h.project_id}-${h.at}`}>
+                      {formatDateTime(h.at)} · {h.mode === 'new' ? 'โปรเจกต์ใหม่' : 'โปรเจกต์เดิม'} ·{' '}
+                      {projectNames.has(h.project_id) ? (
+                        <Link href={`/projects/${h.project_id}`} className="text-indigo-400 hover:text-indigo-300">
+                          {projectNames.get(h.project_id)}
+                        </Link>
+                      ) : (
+                        'โปรเจกต์ถูกลบแล้ว'
+                      )}{' '}
+                      · {h.files.length} ไฟล์
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </DocCard>
+      )}
+
+      {reports.length > (latestReport ? 1 : 0) + (latestSpec ? 1 : 0) && (
+        <p className="text-xs text-neutral-500">
+          มีเอกสารเวอร์ชันก่อนหน้า {reports.length - (latestReport ? 1 : 0) - (latestSpec ? 1 : 0)} ฉบับ (เก็บไว้ ไม่ได้แสดงที่นี่)
+        </p>
       )}
     </div>
   )

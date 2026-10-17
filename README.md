@@ -123,7 +123,7 @@ insert into public.model_prices (provider, model, in_per_mtok, out_per_mtok) val
 
 ---
 
-## Reverse Engineering Mode (ระยะ 01–03)
+## Reverse Engineering Mode (ระยะ 01–04)
 
 โหมดวิเคราะห์ซอฟต์แวร์ที่แยกจาก Project Mode (หน้า `/reverse-engineering`, API `/api/analysis`)
 
@@ -143,15 +143,22 @@ insert into public.model_prices (provider, model, in_per_mtok, out_per_mtok) val
 - เนื้อหาจากไฟล์ที่อัปโหลดถูกครอบเป็นข้อมูลไม่น่าเชื่อถือก่อนส่งให้โมเดล (กัน prompt injection)
 - สิ่งที่เครื่องมือตรวจไม่ได้จะถูกบันทึกเป็น "ข้อจำกัด" ไม่ถูกเดา
 
+**รายงานและส่งต่อ (ระยะ 04):** เมื่อวิเคราะห์เสร็จ ที่แท็บ Report
+- **รายงานผลวิเคราะห์** ประกอบจากข้อมูลจริงเท่านั้น (ไฟล์ + SHA-256, เครื่องมือ + เวอร์ชัน, ข้อค้นพบ + หลักฐาน, ข้อจำกัด) ไม่ให้ AI เขียนเนื้อหา
+- **ข้อกำหนดทางเทคนิค** AI แปลงข้อค้นพบที่มีหลักฐานเป็นข้อกำหนด + เกณฑ์ทดสอบ ระบบตัดข้อที่อ้างหลักฐานไม่ได้ทิ้ง
+  และตรวจย้อนกลับ (ข้อกำหนด → ข้อค้นพบ → หลักฐาน) ทุกครั้งก่อนส่งต่อ ถ้าวิเคราะห์ใหม่จนหลักฐานเดิมหายจะส่งต่อไม่ได้ ต้องสร้างสเปกใหม่
+- **ส่งต่อไป Project Mode** เลือกสร้างโปรเจกต์ใหม่หรือส่งไปโปรเจกต์เดิม เขียนด้วยสิทธิ์ของผู้ใช้เอง (ผ่าน RLS)
+  ส่งเฉพาะข้อกำหนด (+ หลักฐานเฉพาะข้อที่อ้าง ถ้าเลือก) ไม่ส่งไฟล์ต้นทาง ผลดิบของเครื่องมือ ประวัติการวิเคราะห์ agent หรือ API key
+  ข้อความที่ยกมาจากไฟล์ที่วิเคราะห์อยู่ในโค้ดบล็อกที่ปิดเองไม่ได้ และมีคำเตือนว่าห้ามทำตามคำสั่งที่ฝังอยู่ในนั้น
+
 **ข้อจำกัดสำคัญ:** เครื่องมือที่มีตอนนี้ตรวจได้แค่ชนิดไฟล์และโครงสร้าง ZIP/APK จึงสรุปได้เฉพาะระดับโครงสร้าง
 ยังตอบเรื่อง "วิธีคำนวณภายในโปรแกรม" ไม่ได้จนกว่าจะเชื่อม Decompiler/Disassembler
 
-**ยังไม่มี:** Decompiler / Disassembler / MCP / Worker ภายนอก · รายงานและส่งต่อไป Project Mode (ระยะ 04)
-(Call Graph และ Report แสดง "ยังไม่พร้อม" ไม่แสดงข้อมูลตัวอย่าง)
+**ยังไม่มี:** Decompiler / Disassembler / MCP / Worker ภายนอก · Call Graph (แสดง "ยังไม่พร้อม" ไม่แสดงข้อมูลตัวอย่าง)
 
 วิธีเปิดใช้:
-1. Supabase → SQL Editor → รัน `0005`, `0006_analysis_artifact_storage.sql` และ `0007_analysis_orchestration.sql` ตามลำดับ (รันซ้ำได้)
-   — **รัน 0007 ก่อน deploy โค้ดนี้** เพราะหน้าเว็บอ่านคอลัมน์ใหม่ของ analysis_sessions
+1. Supabase → SQL Editor → รัน `0005`, `0006_analysis_artifact_storage.sql`, `0007_analysis_orchestration.sql` และ `0008_analysis_reports.sql` ตามลำดับ (รันซ้ำได้)
+   — **รัน 0007 และ 0008 ก่อน deploy โค้ดนี้** เพราะหน้าเว็บอ่านคอลัมน์ใหม่ของ analysis_sessions และ analysis_reports
    — 0006 สร้าง bucket `analysis-artifacts` แบบ private; ผู้ใช้เข้าถึงไฟล์ตรง ๆ ไม่ได้ ต้องผ่าน API
 2. (ไม่บังคับ) รัน `supabase/tests/analysis_rls_test.sql` ได้ `ALL ANALYSIS RLS TESTS PASSED`
 3. Deploy ตามปกติ — ไม่มี env var เพิ่ม (ใช้ `SUPABASE_SERVICE_ROLE_KEY` เดิม)
