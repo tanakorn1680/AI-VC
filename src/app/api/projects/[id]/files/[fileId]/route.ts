@@ -1,6 +1,7 @@
 import { requireUser } from '@/lib/supabase/auth'
-import { apiOk, apiError } from '@/lib/utils/api'
+import { apiOk, apiError, parseBody } from '@/lib/utils/api'
 import { isValidUUID } from '@/lib/utils/sanitize'
+import { normalizeFilePath } from '@/lib/files/path'
 
 /** GET ?version=<uuid> — เนื้อหาไฟล์ (เวอร์ชันปัจจุบัน หรือเวอร์ชันที่ระบุ) + ประวัติเวอร์ชัน */
 export async function GET(
@@ -86,4 +87,39 @@ export async function DELETE(
   if (error) return apiError('FORBIDDEN', 'ลบไม่ได้: ' + error.message)
 
   return apiOk({ ok: true })
+}
+
+/** เปลี่ยนชื่อ/path ของไฟล์ (ประวัติเวอร์ชันยังอยู่กับไฟล์เดิม) */
+export async function PATCH(
+  req: Request,
+  { params }: { params: Promise<{ id: string; fileId: string }> }
+) {
+  const { id, fileId } = await params
+  if (!isValidUUID(id) || !isValidUUID(fileId)) return apiError('BAD_REQUEST', 'id ไม่ถูกต้อง')
+
+  const auth = await requireUser()
+  if (!auth) return apiError('UNAUTHORIZED', 'ต้องล็อกอินก่อน')
+
+  const [body, err] = await parseBody<{ path: string }>(req)
+  if (err) return err
+  const check = normalizeFilePath(body.path)
+  if (!check.ok) return apiError('BAD_REQUEST', check.error)
+
+  // RLS (files_all_owner) ปฏิเสธเองถ้า project ไม่ใช่ของผู้ใช้ — ไม่มีแถวที่แก้ได้ = ไม่พบ
+  const { data, error } = await auth.supabase
+    .from('files')
+    .update({ path: check.path })
+    .eq('id', fileId)
+    .eq('project_id', id)
+    .is('deleted_at', null)
+    .select('id, path')
+    .maybeSingle()
+  if (error) {
+    // unique index files_project_path_uniq: path นี้มีไฟล์อื่นใช้อยู่แล้ว
+    if (error.code === '23505') return apiError('BAD_REQUEST', 'มีไฟล์ชื่อนี้อยู่แล้วในโฟลเดอร์เดียวกัน')
+    return apiError('FORBIDDEN', 'เปลี่ยนชื่อไม่ได้: ' + error.message)
+  }
+  if (!data) return apiError('NOT_FOUND', 'ไม่พบไฟล์')
+
+  return apiOk({ file: data })
 }

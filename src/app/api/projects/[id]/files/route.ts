@@ -23,15 +23,23 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const rows = (files ?? []) as Array<{ id: string; path: string; current_version_id: string | null; created_at: string }>
   const versionIds = rows.map((f) => f.current_version_id).filter((v): v is string => !!v)
 
-  // เวลาอัปเดตล่าสุด = เวลาของเวอร์ชันปัจจุบัน
+  // เวลาอัปเดตล่าสุดและขนาด = ของเวอร์ชันปัจจุบัน
   const updatedAt = new Map<string, string>()
+  const sizeOf = new Map<string, number>()
   if (versionIds.length > 0) {
-    const { data: versions } = await auth.supabase
-      .from('file_versions')
-      .select('id, created_at')
-      .in('id', versionIds)
-    for (const v of (versions ?? []) as Array<{ id: string; created_at: string }>) {
+    type VersionRow = { id: string; created_at: string; size_bytes?: number | null }
+    let versions: VersionRow[] | null = null
+    const withSize = await auth.supabase.from('file_versions').select('id, created_at, size_bytes').in('id', versionIds)
+    if (withSize.error) {
+      // ยังไม่ได้รัน migration 0009 (ไม่มีคอลัมน์ size_bytes): ใช้แบบเดิม ไม่แสดงขนาด
+      const basic = await auth.supabase.from('file_versions').select('id, created_at').in('id', versionIds)
+      versions = (basic.data ?? []) as VersionRow[]
+    } else {
+      versions = (withSize.data ?? []) as VersionRow[]
+    }
+    for (const v of versions) {
       updatedAt.set(v.id, v.created_at)
+      if (typeof v.size_bytes === 'number') sizeOf.set(v.id, v.size_bytes)
     }
   }
 
@@ -40,6 +48,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       id: f.id,
       path: f.path,
       updated_at: (f.current_version_id && updatedAt.get(f.current_version_id)) || f.created_at,
+      size_bytes: (f.current_version_id && sizeOf.get(f.current_version_id)) ?? null,
     })),
   })
 }

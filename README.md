@@ -123,6 +123,12 @@ insert into public.model_prices (provider, model, in_per_mtok, out_per_mtok) val
 
 ---
 
+## หน้า Files ของ Project Mode
+
+แสดงเป็นการ์ดแบบแอปจัดการไฟล์: โฟลเดอร์ (สร้างจาก path ของไฟล์) + เส้นทาง Root / … · ขนาดไฟล์ · วงกลมเลือกหลายรายการ
+· แตะไฟล์เพื่อเปิดเมนู Open / Download / Rename / Delete · ปุ่ม + สร้างไฟล์ใหม่/อัปโหลด zip · ปุ่ม History = ไฟล์ที่แก้ล่าสุด
+ขนาดไฟล์ต้องรัน `supabase/migrations/0009_file_version_size.sql` (ไม่รันก็ใช้งานได้ แต่จะไม่แสดงขนาด)
+
 ## Reverse Engineering Mode (ระยะ 01–04)
 
 โหมดวิเคราะห์ซอฟต์แวร์ที่แยกจาก Project Mode (หน้า `/reverse-engineering`, API `/api/analysis`)

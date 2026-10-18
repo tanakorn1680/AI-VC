@@ -1,12 +1,14 @@
 'use client'
 
-import { useCallback, useEffect, useState, type ChangeEvent, type FormEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type FormEvent, type ReactNode } from 'react'
 import ZipImport from './zip-import'
 
 interface FileItem {
   id: string
   path: string
   updated_at: string
+  /** null = ยังไม่ได้รัน migration 0009 จึงไม่ทราบขนาด */
+  size_bytes: number | null
 }
 
 interface VersionItem {
@@ -32,28 +34,42 @@ const primaryBtn =
 const ghostBtn =
   'inline-flex items-center gap-1.5 rounded-md border border-neutral-700 px-2.5 py-1.5 text-xs text-neutral-300 transition hover:bg-neutral-800 disabled:opacity-50'
 
-function Icon({ children }: { children: ReactNode }) {
+function Icon({ children, size = 16, fill = 'none' }: { children: ReactNode; size?: number; fill?: string }) {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg width={size} height={size} viewBox="0 0 24 24" fill={fill} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       {children}
     </svg>
   )
 }
-const BackIcon = () => <Icon><path d="M15 6l-6 6 6 6" /></Icon>
-const PlusIcon = () => <Icon><path d="M12 5v14M5 12h14" /></Icon>
-const FileIcon = () => <Icon><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5" /></Icon>
-const CopyIcon = () => <Icon><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></Icon>
-const DownloadIcon = () => <Icon><path d="M12 4v11M7 11l5 5 5-5M5 20h14" /></Icon>
-const EditIcon = () => <Icon><path d="M4 20h4L19 9l-4-4L4 16z" /><path d="M13.5 6.5l4 4" /></Icon>
-const UploadIcon = () => <Icon><path d="M12 16V4M7 9l5-5 5 5M5 20h14" /></Icon>
-const TrashIcon = () => <Icon><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6" /></Icon>
-const CheckSquareIcon = () => <Icon><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M8 12l3 3 5-6" /></Icon>
+type IconProps = { size?: number }
+const BackIcon = ({ size }: IconProps) => <Icon size={size}><path d="M15 6l-6 6 6 6" /></Icon>
+const PlusIcon = ({ size }: IconProps) => <Icon size={size}><path d="M12 5v14M5 12h14" /></Icon>
+const FileIcon = ({ size }: IconProps) => <Icon size={size}><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5" /></Icon>
+const FolderIcon = ({ size }: IconProps) => <Icon size={size} fill="currentColor"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></Icon>
+const CopyIcon = ({ size }: IconProps) => <Icon size={size}><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></Icon>
+const DownloadIcon = ({ size }: IconProps) => <Icon size={size}><path d="M12 4v11M7 11l5 5 5-5M5 20h14" /></Icon>
+const EditIcon = ({ size }: IconProps) => <Icon size={size}><path d="M4 20h4L19 9l-4-4L4 16z" /><path d="M13.5 6.5l4 4" /></Icon>
+const OpenIcon = ({ size }: IconProps) => <Icon size={size}><path d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-5" /><path d="M18.5 3.5l2 2L12 14l-3 1 1-3z" /></Icon>
+const UploadIcon = ({ size }: IconProps) => <Icon size={size}><path d="M12 16V4M7 9l5-5 5 5M5 20h14" /></Icon>
+const TrashIcon = ({ size }: IconProps) => <Icon size={size}><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6" /></Icon>
+const ClockIcon = ({ size }: IconProps) => <Icon size={size}><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></Icon>
+const CheckIcon = ({ size }: IconProps) => <Icon size={size}><path d="M5 12.5l4.5 4.5L19 7.5" /></Icon>
 
 function formatTime(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
   return d.toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' })
 }
+
+function formatSize(n: number | null): string {
+  if (n === null) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+const baseName = (path: string) => path.split('/').pop() || path
+const dirName = (path: string) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/') + 1) : '')
 
 async function readError(res: Response, fallback: string): Promise<string> {
   try {
@@ -64,13 +80,47 @@ async function readError(res: Response, fallback: string): Promise<string> {
   }
 }
 
+/** รายการในโฟลเดอร์ปัจจุบัน: โฟลเดอร์ (สร้างจาก path ของไฟล์ ไม่มีตารางโฟลเดอร์จริง) ตามด้วยไฟล์ */
+type Entry =
+  | { kind: 'folder'; key: string; name: string; fileIds: string[] }
+  | { kind: 'file'; key: string; name: string; item: FileItem }
+
+function listDir(files: FileItem[], cwd: string[]): Entry[] {
+  const prefix = cwd.length ? `${cwd.join('/')}/` : ''
+  const folders = new Map<string, string[]>()
+  const here: Entry[] = []
+  for (const f of files) {
+    if (!f.path.startsWith(prefix)) continue
+    const rest = f.path.slice(prefix.length)
+    const slash = rest.indexOf('/')
+    if (slash >= 0) {
+      const name = rest.slice(0, slash)
+      folders.set(name, [...(folders.get(name) ?? []), f.id])
+    } else {
+      here.push({ kind: 'file', key: f.id, name: rest, item: f })
+    }
+  }
+  const byName = (a: { name: string }, b: { name: string }) => {
+    const x = a.name.toLowerCase()
+    const y = b.name.toLowerCase()
+    return x < y ? -1 : x > y ? 1 : 0
+  }
+  const folderEntries: Entry[] = [...folders].map(([name, fileIds]) => ({ kind: 'folder', key: `d:${name}`, name, fileIds }))
+  return [...folderEntries.sort(byName), ...here.sort(byName)]
+}
+
+const idsOf = (e: Entry) => (e.kind === 'folder' ? e.fileIds : [e.item.id])
+
 export default function FilesPanel({ projectId }: { projectId: string }) {
   const [view, setView] = useState<View>({ kind: 'list' })
+  // โฟลเดอร์ที่เปิดอยู่ เก็บไว้ที่นี่เพื่อให้กลับจากหน้าไฟล์แล้วยังอยู่โฟลเดอร์เดิม
+  const [cwd, setCwd] = useState<string[]>([])
 
   if (view.kind === 'new') {
     return (
       <NewFile
         projectId={projectId}
+        initialPath={cwd.length ? `${cwd.join('/')}/` : ''}
         onCancel={() => setView({ kind: 'list' })}
         onSaved={(id) => setView({ kind: 'file', id })}
       />
@@ -92,6 +142,8 @@ export default function FilesPanel({ projectId }: { projectId: string }) {
   return (
     <FileList
       projectId={projectId}
+      cwd={cwd}
+      onNavigate={setCwd}
       onOpen={(id) => setView({ kind: 'file', id })}
       onNew={() => setView({ kind: 'new' })}
       onImport={(file) => setView({ kind: 'import', file })}
@@ -99,22 +151,220 @@ export default function FilesPanel({ projectId }: { projectId: string }) {
   )
 }
 
+/** แผงด้านล่างแบบเดียวกับแอปมือถือ: แตะฉากหลังหรือกด Esc เพื่อปิด */
+function Sheet({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prevOverflow
+    }
+  }, [onClose])
+
+  return (
+    <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label={title}>
+      <button aria-label="ปิด" onClick={onClose} className="absolute inset-0 cursor-default bg-black/60" />
+      <div
+        className="absolute inset-x-0 bottom-0 mx-auto max-h-[85vh] max-w-3xl overflow-y-auto rounded-t-2xl bg-neutral-800 px-5 pt-3 shadow-2xl"
+        style={{ paddingBottom: 'calc(1.25rem + env(safe-area-inset-bottom))' }}
+      >
+        <div className="mx-auto mb-4 h-1 w-10 rounded-full bg-neutral-600" />
+        <h3 className="mb-2 truncate text-xl font-semibold">{title}</h3>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function SheetItem({
+  icon,
+  label,
+  onClick,
+  danger,
+  disabled,
+}: {
+  icon: ReactNode
+  label: string
+  onClick: () => void
+  danger?: boolean
+  disabled?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex w-full items-center gap-4 rounded-lg px-1 py-3.5 text-left text-base transition hover:bg-neutral-700/50 disabled:opacity-50 ${
+        danger ? 'text-red-400' : 'text-neutral-100'
+      }`}
+    >
+      <span className={danger ? 'text-red-400' : 'text-neutral-400'}>{icon}</span>
+      {label}
+    </button>
+  )
+}
+
+/** เมนูของไฟล์: Open / Download / Rename / Delete */
+function FileSheet({
+  projectId,
+  item,
+  onClose,
+  onOpen,
+  onChanged,
+}: {
+  projectId: string
+  item: FileItem
+  onClose: () => void
+  onOpen: (id: string) => void
+  onChanged: () => Promise<void>
+}) {
+  const [mode, setMode] = useState<'menu' | 'rename'>('menu')
+  const [name, setName] = useState(baseName(item.path))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function download() {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    try {
+      const res = await fetch(`/api/projects/${projectId}/files/${item.id}`)
+      if (!res.ok) {
+        setError(await readError(res, 'ดาวน์โหลดไม่สำเร็จ'))
+        return
+      }
+      const detail = (await res.json()) as FileDetail
+      const url = URL.createObjectURL(new Blob([detail.content], { type: 'text/plain;charset=utf-8' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = baseName(item.path)
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      onClose()
+    } catch {
+      setError('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่อีกครั้ง')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function rename(e: FormEvent) {
+    e.preventDefault()
+    if (busy) return
+    const next = name.trim()
+    if (!next) return setError('ชื่อไฟล์ต้องไม่ว่าง')
+    // เปลี่ยนได้เฉพาะชื่อ ไม่ให้ย้ายโฟลเดอร์ผ่านช่องนี้
+    if (next.includes('/') || next.includes('\\')) return setError('ชื่อไฟล์ห้ามมี / หรือ \\')
+    if (next === baseName(item.path)) return onClose()
+
+    setBusy(true)
+    setError('')
+    try {
+      const res = await fetch(`/api/projects/${projectId}/files/${item.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: dirName(item.path) + next }),
+      })
+      if (!res.ok) {
+        setError(await readError(res, 'เปลี่ยนชื่อไม่สำเร็จ'))
+        return
+      }
+      await onChanged()
+      onClose()
+    } catch {
+      setError('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่อีกครั้ง')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove() {
+    if (busy) return
+    if (!window.confirm(`ลบไฟล์ "${item.path}" ?`)) return
+    setBusy(true)
+    setError('')
+    try {
+      const res = await fetch(`/api/projects/${projectId}/files/${item.id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        setError(await readError(res, 'ลบไม่สำเร็จ'))
+        return
+      }
+      await onChanged()
+      onClose()
+    } catch {
+      setError('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่อีกครั้ง')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (mode === 'rename') {
+    return (
+      <Sheet title="เปลี่ยนชื่อ" onClose={onClose}>
+        <form onSubmit={rename} className="space-y-3 pb-1">
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={200}
+            spellCheck={false}
+            aria-label="ชื่อไฟล์ใหม่"
+            className={`${inputCls} font-mono`}
+          />
+          {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
+          <div className="flex gap-2">
+            <button type="submit" disabled={busy} className={primaryBtn}>
+              {busy ? 'กำลังบันทึก...' : 'บันทึก'}
+            </button>
+            <button type="button" onClick={() => { setMode('menu'); setError('') }} disabled={busy} className={ghostBtn}>
+              ยกเลิก
+            </button>
+          </div>
+        </form>
+      </Sheet>
+    )
+  }
+
+  return (
+    <Sheet title={baseName(item.path)} onClose={onClose}>
+      <SheetItem icon={<OpenIcon size={22} />} label="Open" onClick={() => { onClose(); onOpen(item.id) }} />
+      <SheetItem icon={<DownloadIcon size={22} />} label={busy ? 'กำลังดาวน์โหลด...' : 'Download'} onClick={download} disabled={busy} />
+      <SheetItem icon={<EditIcon size={22} />} label="Rename" onClick={() => setMode('rename')} disabled={busy} />
+      <div className="my-1 border-t border-neutral-700" />
+      <SheetItem icon={<TrashIcon size={22} />} label="Delete" onClick={remove} danger disabled={busy} />
+      {error && <p role="alert" className="mt-2 text-sm text-red-400">{error}</p>}
+    </Sheet>
+  )
+}
+
 function FileList({
   projectId,
+  cwd,
+  onNavigate,
   onOpen,
   onNew,
   onImport,
 }: {
   projectId: string
+  cwd: string[]
+  onNavigate: (cwd: string[]) => void
   onOpen: (id: string) => void
   onNew: () => void
   onImport: (file: File) => void
 }) {
   const [files, setFiles] = useState<FileItem[] | null>(null)
   const [error, setError] = useState('')
-  const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [deleting, setDeleting] = useState(false)
+  const [sheet, setSheet] = useState<{ kind: 'file'; item: FileItem } | { kind: 'history' } | null>(null)
+  const [menuOpen, setMenuOpen] = useState(false)
+
+  const selecting = selected.size > 0
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/projects/${projectId}/files`)
@@ -127,31 +377,41 @@ function FileList({
   }, [projectId])
 
   // agent อาจสร้างไฟล์ระหว่างที่เปิดหน้านี้อยู่ จึงรีเฟรชเป็นระยะ
-  // (หยุดรีเฟรชอัตโนมัติระหว่างกำลังเลือกไฟล์ลบ กันรายการสั่นตอนผู้ใช้กำลังกดเลือกอยู่)
+  // (หยุดรีเฟรชอัตโนมัติระหว่างกำลังเลือกไฟล์ กันรายการสั่นตอนผู้ใช้กำลังกดเลือกอยู่)
   useEffect(() => {
     void load()
-    if (selectMode) return
+    if (selecting) return
     const t = setInterval(() => void load(), 5000)
     return () => clearInterval(t)
-  }, [load, selectMode])
+  }, [load, selecting])
 
-  function toggleSelectMode() {
-    setSelectMode((on) => !on)
-    setSelected(new Set())
+  const entries = useMemo(() => listDir(files ?? [], cwd), [files, cwd])
+
+  // โฟลเดอร์ที่เปิดอยู่ไม่มีไฟล์เหลือแล้ว (ถูกลบ/ย้าย) → ถอยขึ้นหนึ่งระดับ
+  useEffect(() => {
+    if (!files || cwd.length === 0) return
+    const prefix = `${cwd.join('/')}/`
+    if (!files.some((f) => f.path.startsWith(prefix))) onNavigate(cwd.slice(0, -1))
+  }, [files, cwd, onNavigate])
+
+  const isSelected = (e: Entry) => {
+    const ids = idsOf(e)
+    return ids.length > 0 && ids.every((id) => selected.has(id))
   }
 
-  function toggleOne(id: string) {
+  function toggleEntry(e: Entry) {
+    const ids = idsOf(e)
     setSelected((prev) => {
       const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
+      if (ids.every((id) => next.has(id))) ids.forEach((id) => next.delete(id))
+      else ids.forEach((id) => next.add(id))
       return next
     })
   }
 
   function toggleAll() {
-    if (!files) return
-    setSelected((prev) => (prev.size === files.length ? new Set() : new Set(files.map((f) => f.id))))
+    const all = entries.flatMap(idsOf)
+    setSelected((prev) => (all.every((id) => prev.has(id)) ? new Set() : new Set(all)))
   }
 
   async function deleteSelected() {
@@ -171,111 +431,212 @@ function FileList({
       return
     }
     setSelected(new Set())
-    setSelectMode(false)
     await load()
   }
 
+  const recent = useMemo(
+    () => [...(files ?? [])].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1)).slice(0, 30),
+    [files]
+  )
+
   return (
-    <section>
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-medium text-neutral-300">Files{files ? ` (${files.length})` : ''}</h2>
-        <div className="flex items-center gap-2">
-          {selectMode ? (
-            <>
-              <button onClick={toggleAll} className={ghostBtn}>
-                {files && selected.size === files.length ? 'ยกเลิกทั้งหมด' : 'เลือกทั้งหมด'}
-              </button>
+    <section className="pb-24">
+      {/* แถบบน: เส้นทางโฟลเดอร์ + History หรือแถบการเลือก */}
+      <div className="mb-4 flex min-h-10 items-center justify-between gap-3 border-b border-neutral-800 pb-3">
+        {selecting ? (
+          <>
+            <span className="text-sm font-medium text-neutral-200">เลือกแล้ว {selected.size} ไฟล์</span>
+            <div className="flex items-center gap-2">
+              <button onClick={toggleAll} className={ghostBtn}>เลือกทั้งหมด</button>
               <button
                 onClick={deleteSelected}
-                disabled={selected.size === 0 || deleting}
-                className="inline-flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-2 text-sm font-medium hover:bg-red-500 disabled:opacity-50"
+                disabled={deleting}
+                className="inline-flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium hover:bg-red-500 disabled:opacity-50"
               >
                 <TrashIcon />
                 {deleting ? 'กำลังลบ...' : `ลบ (${selected.size})`}
               </button>
-              <button onClick={toggleSelectMode} className={ghostBtn}>
-                ยกเลิก
+              <button onClick={() => setSelected(new Set())} className={ghostBtn}>ยกเลิก</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <nav aria-label="เส้นทางโฟลเดอร์" className="flex min-w-0 items-center gap-1.5 overflow-x-auto whitespace-nowrap text-sm">
+              <button
+                onClick={() => onNavigate([])}
+                className={cwd.length === 0 ? 'font-medium text-neutral-200' : 'text-neutral-400 transition hover:text-neutral-200'}
+              >
+                Root
               </button>
-            </>
-          ) : (
-            <>
-              <button onClick={toggleSelectMode} className={ghostBtn}>
-                <CheckSquareIcon />
-                เลือกหลายไฟล์
-              </button>
-              <label className="inline-flex min-h-9 cursor-pointer items-center gap-1.5 rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-200 transition hover:bg-neutral-800 focus-within:border-indigo-500">
-                <UploadIcon />
-                อัปโหลด zip
-                <input
-                  type="file"
-                  accept=".zip,application/zip,application/x-zip-compressed"
-                  className="sr-only"
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                    const picked = e.target.files?.[0]
-                    e.target.value = '' // เลือกไฟล์เดิมซ้ำได้อีก
-                    if (picked) onImport(picked)
-                  }}
-                />
-              </label>
-              <button onClick={onNew} className={primaryBtn}>
-                <PlusIcon />
-                ไฟล์ใหม่
-              </button>
-            </>
-          )}
-        </div>
-      </div>
-      {error && <p className="mb-2 text-sm text-red-400">{error}</p>}
-      <div className="space-y-2">
-        {files?.map((f) => (
-          <div
-            key={f.id}
-            className="flex w-full items-center gap-3 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-left text-sm transition hover:border-neutral-700"
-          >
-            {selectMode && (
-              <input
-                type="checkbox"
-                checked={selected.has(f.id)}
-                onChange={() => toggleOne(f.id)}
-                className="size-4 shrink-0 accent-indigo-600"
-                aria-label={`เลือก ${f.path}`}
-              />
-            )}
+              {cwd.map((seg, i) => (
+                <span key={`${i}-${seg}`} className="flex items-center gap-1.5">
+                  <span className="text-neutral-600">/</span>
+                  <button
+                    onClick={() => onNavigate(cwd.slice(0, i + 1))}
+                    className={i === cwd.length - 1 ? 'font-medium text-neutral-200' : 'text-neutral-400 transition hover:text-neutral-200'}
+                  >
+                    {seg}
+                  </button>
+                </span>
+              ))}
+            </nav>
             <button
-              onClick={() => (selectMode ? toggleOne(f.id) : onOpen(f.id))}
-              className="flex min-w-0 flex-1 items-center gap-3 text-left"
+              onClick={() => setSheet({ kind: 'history' })}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-neutral-700 px-3.5 py-1.5 text-sm text-neutral-300 transition hover:bg-neutral-800"
             >
-              <span className="shrink-0 text-neutral-500">
-                <FileIcon />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate font-mono text-[13px]">{f.path}</span>
-                <span className="block text-xs text-neutral-500">แก้ล่าสุด {formatTime(f.updated_at)}</span>
-              </span>
+              <ClockIcon size={16} />
+              History
             </button>
-          </div>
-        ))}
-        {files && files.length === 0 && (
-          <p className="text-sm text-neutral-500">
-            ยังไม่มีไฟล์ — agent ที่เปิดสิทธิ์ &quot;สร้าง/แก้ไฟล์ได้&quot; จะบันทึกไฟล์ที่ทำเสร็จไว้ที่นี่ กด &quot;ไฟล์ใหม่&quot; เพื่อสร้างเอง หรือ &quot;อัปโหลด zip&quot; เพื่อนำเข้าทั้งโปรเจกต์
+          </>
+        )}
+      </div>
+
+      {error && <p role="alert" className="mb-3 text-sm text-red-400">{error}</p>}
+
+      <div className="space-y-2.5">
+        {entries.map((e) => {
+          const on = isSelected(e)
+          return (
+            <div
+              key={e.key}
+              className={`flex items-center gap-3 rounded-2xl border bg-neutral-900 px-4 py-3.5 transition ${
+                on ? 'border-indigo-500' : 'border-neutral-800 hover:border-neutral-700'
+              }`}
+            >
+              <button
+                onClick={() => {
+                  if (selecting) toggleEntry(e)
+                  else if (e.kind === 'folder') onNavigate([...cwd, e.name])
+                  else setSheet({ kind: 'file', item: e.item })
+                }}
+                className="flex min-w-0 flex-1 items-center gap-4 text-left"
+              >
+                <span className={`shrink-0 ${e.kind === 'folder' ? 'text-blue-400' : 'text-neutral-500'}`}>
+                  {e.kind === 'folder' ? <FolderIcon size={28} /> : <FileIcon size={28} />}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-base">{e.name}</span>
+                <span className="shrink-0 text-sm text-neutral-500">
+                  {e.kind === 'folder' ? `${e.fileIds.length} ไฟล์` : formatSize(e.item.size_bytes)}
+                </span>
+              </button>
+              <button
+                onClick={() => toggleEntry(e)}
+                role="checkbox"
+                aria-checked={on}
+                aria-label={`เลือก ${e.name}`}
+                className={`grid size-7 shrink-0 place-items-center rounded-full border-2 transition ${
+                  on ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-neutral-600 text-transparent hover:border-neutral-400'
+                }`}
+              >
+                <CheckIcon size={16} />
+              </button>
+            </div>
+          )
+        })}
+
+        {files && entries.length === 0 && (
+          <p className="px-1 py-6 text-sm leading-relaxed text-neutral-500">
+            {files.length === 0
+              ? 'ยังไม่มีไฟล์ — agent ที่เปิดสิทธิ์ "สร้าง/แก้ไฟล์ได้" จะบันทึกไฟล์ที่ทำเสร็จไว้ที่นี่ กดปุ่ม + เพื่อสร้างไฟล์เอง หรืออัปโหลด zip เพื่อนำเข้าทั้งโปรเจกต์'
+              : 'โฟลเดอร์นี้ว่าง'}
           </p>
         )}
-        {!files && !error && <p className="text-sm text-neutral-500">กำลังโหลด...</p>}
+        {!files && !error && <p className="px-1 text-sm text-neutral-500">กำลังโหลด...</p>}
       </div>
+
+      {/* ปุ่ม + ลอย: สร้างไฟล์ใหม่ / อัปโหลด zip */}
+      {!selecting && !sheet && (
+        <>
+          {menuOpen && <button aria-label="ปิดเมนู" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-30 cursor-default" />}
+          <div className="fixed right-5 z-40 flex flex-col items-end gap-2" style={{ bottom: 'calc(1.5rem + env(safe-area-inset-bottom))' }}>
+            {menuOpen && (
+              <div className="w-52 overflow-hidden rounded-xl border border-neutral-700 bg-neutral-800 shadow-xl">
+                <button
+                  onClick={() => { setMenuOpen(false); onNew() }}
+                  className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm text-neutral-100 transition hover:bg-neutral-700/50"
+                >
+                  <PlusIcon size={18} />
+                  ไฟล์ใหม่
+                </button>
+                <label className="flex w-full cursor-pointer items-center gap-3 border-t border-neutral-700 px-4 py-3 text-sm text-neutral-100 transition focus-within:bg-neutral-700/50 hover:bg-neutral-700/50">
+                  <UploadIcon size={18} />
+                  อัปโหลด zip
+                  <input
+                    type="file"
+                    accept=".zip,application/zip,application/x-zip-compressed"
+                    className="sr-only"
+                    onChange={(ev: ChangeEvent<HTMLInputElement>) => {
+                      const picked = ev.target.files?.[0]
+                      ev.target.value = '' // เลือกไฟล์เดิมซ้ำได้อีก
+                      setMenuOpen(false)
+                      if (picked) onImport(picked)
+                    }}
+                  />
+                </label>
+              </div>
+            )}
+            <button
+              onClick={() => setMenuOpen((o) => !o)}
+              aria-label="เพิ่มไฟล์"
+              aria-expanded={menuOpen}
+              className={`grid size-14 place-items-center rounded-full bg-blue-600 text-white shadow-lg transition hover:bg-blue-500 ${menuOpen ? 'rotate-45' : ''}`}
+            >
+              <PlusIcon size={28} />
+            </button>
+          </div>
+        </>
+      )}
+
+      {sheet?.kind === 'file' && (
+        <FileSheet
+          projectId={projectId}
+          item={sheet.item}
+          onClose={() => setSheet(null)}
+          onOpen={onOpen}
+          onChanged={load}
+        />
+      )}
+      {sheet?.kind === 'history' && (
+        <Sheet title="แก้ไขล่าสุด" onClose={() => setSheet(null)}>
+          {recent.length === 0 ? (
+            <p className="py-4 text-sm text-neutral-400">ยังไม่มีไฟล์</p>
+          ) : (
+            <ul>
+              {recent.map((f) => (
+                <li key={f.id}>
+                  <button
+                    onClick={() => { setSheet(null); onOpen(f.id) }}
+                    className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-3 text-left transition hover:bg-neutral-700/50"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-base text-neutral-100">{baseName(f.path)}</span>
+                      {dirName(f.path) && <span className="block truncate text-xs text-neutral-500">{dirName(f.path)}</span>}
+                    </span>
+                    <span className="shrink-0 text-xs text-neutral-500">{formatTime(f.updated_at)}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Sheet>
+      )}
     </section>
   )
 }
 
 function NewFile({
   projectId,
+  initialPath,
   onCancel,
   onSaved,
 }: {
   projectId: string
+  /** ขึ้นต้น path ด้วยโฟลเดอร์ที่ผู้ใช้เปิดอยู่ */
+  initialPath: string
   onCancel: () => void
   onSaved: (id: string) => void
 }) {
-  const [path, setPath] = useState('')
+  const [path, setPath] = useState(initialPath)
   const [content, setContent] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
