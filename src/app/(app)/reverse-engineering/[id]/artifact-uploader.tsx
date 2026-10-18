@@ -8,7 +8,7 @@ import { ANALYSIS_BUCKET, MAX_ARTIFACT_BYTES } from '@/lib/analysis/limits'
 type Phase = 'idle' | 'preparing' | 'uploading' | 'registering'
 
 const PHASE_LABEL: Record<Phase, string> = {
-  idle: 'เลือกไฟล์เป้าหมาย',
+  idle: '',
   preparing: 'กำลังเตรียมการอัปโหลด...',
   uploading: 'กำลังอัปโหลด...',
   registering: 'กำลังตรวจสอบไฟล์...',
@@ -25,6 +25,7 @@ async function postJson<T>(url: string, payload: unknown): Promise<T> {
   return body as T
 }
 
+/** ข้อความสถานะ + ปุ่ม + ลอยมุมขวาล่างสำหรับเลือกไฟล์เป้าหมาย */
 export default function ArtifactUploader({ sessionId }: { sessionId: string }) {
   const router = useRouter()
   const inputRef = useRef<HTMLInputElement>(null)
@@ -66,7 +67,7 @@ export default function ArtifactUploader({ sessionId }: { sessionId: string }) {
   }
 
   return (
-    <div className="mb-4">
+    <div className="mb-3">
       <input
         ref={inputRef}
         type="file"
@@ -78,25 +79,34 @@ export default function ArtifactUploader({ sessionId }: { sessionId: string }) {
           if (f) void handleFile(f)
         }}
       />
-      <label
-        htmlFor="artifact-file"
-        className={`inline-flex cursor-pointer items-center gap-2 rounded-md border border-dashed border-neutral-700 px-4 py-2.5 text-sm text-neutral-300 transition hover:border-indigo-600 ${
-          busy ? 'pointer-events-none opacity-60' : ''
-        }`}
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M12 16V4M7 9l5-5 5 5M5 20h14" />
-        </svg>
-        {PHASE_LABEL[phase]}
-      </label>
-      <p className="mt-1.5 text-xs text-neutral-500">
-        ไฟล์ละไม่เกิน {MAX_ARTIFACT_BYTES / 1024 / 1024} MB · ระบบตรวจชนิดจากเนื้อไฟล์ ไม่ใช่นามสกุล
+      <p className="text-xs text-neutral-500" aria-live="polite">
+        {busy
+          ? PHASE_LABEL[phase]
+          : `แตะปุ่ม + เพื่อเลือกไฟล์เป้าหมาย · ไฟล์ละไม่เกิน ${MAX_ARTIFACT_BYTES / 1024 / 1024} MB · ระบบตรวจชนิดจากเนื้อไฟล์ ไม่ใช่นามสกุล`}
       </p>
       {error && (
         <p role="alert" className="mt-2 text-sm text-red-400">
           {error}
         </p>
       )}
+      <label
+        htmlFor="artifact-file"
+        aria-label="เลือกไฟล์เป้าหมาย"
+        className={`fixed right-5 z-40 grid size-14 cursor-pointer place-items-center rounded-full bg-blue-600 text-white shadow-lg transition hover:bg-blue-500 ${
+          busy ? 'pointer-events-none opacity-70' : ''
+        }`}
+        style={{ bottom: 'calc(1.5rem + env(safe-area-inset-bottom))' }}
+      >
+        {busy ? (
+          <svg className="animate-spin" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <path d="M12 3a9 9 0 1 0 9 9" />
+          </svg>
+        ) : (
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+        )}
+      </label>
     </div>
   )
 }

@@ -110,3 +110,28 @@ export const StopIcon = ({ size }: IconProps) => (
     <rect x="9" y="9" width="6" height="6" rx="1" />
   </Svg>
 )
+
+export const CheckIcon = ({ size }: IconProps) => (
+  <Svg size={size}>
+    <path d="M5 12.5l4.5 4.5L19 7.5" />
+  </Svg>
+)
+
+export const DownloadIcon = ({ size }: IconProps) => (
+  <Svg size={size}>
+    <path d="M12 4v11M7 11l5 5 5-5M5 20h14" />
+  </Svg>
+)
+
+export const OpenIcon = ({ size }: IconProps) => (
+  <Svg size={size}>
+    <path d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-5" />
+    <path d="M14 4h6v6M20 4l-9 9" />
+  </Svg>
+)
+
+export const BracesIcon = ({ size }: IconProps) => (
+  <Svg size={size}>
+    <path d="M9 4C7 4 6 5 6 7v2c0 1.5-1 3-3 3 2 0 3 1.5 3 3v2c0 2 1 3 3 3M15 4c2 0 3 1 3 3v2c0 1.5 1 3 3 3-2 0-3 1.5-3 3v2c0 2-1 3-3 3" />
+  </Svg>
+)

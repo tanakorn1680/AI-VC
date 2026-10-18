@@ -11,7 +11,6 @@ import { PHASES } from './phases'
 import { getRegistry, supportsKind } from '@/lib/analysis/tool-registry'
 import {
   ARTIFACT_COLUMNS,
-  ARTIFACT_KIND_LABELS,
   CONFIDENCE_LABELS,
   REPORT_COLUMNS,
   REPORT_KIND_LABELS,
@@ -28,7 +27,7 @@ import { CreateDocButton, DownloadButton } from './report-actions'
 import HandoffForm from './handoff-form'
 import { loadSnapshot } from '@/lib/analysis/report'
 import { verifyTraceability, type SpecMeta } from '@/lib/analysis/spec'
-import RunToolButton from './run-tool-button'
+import ArtifactList from './artifact-list'
 
 type Db = SupabaseClient
 
@@ -228,59 +227,23 @@ export async function ArtifactsPanel({ supabase, sessionId }: { supabase: Db; se
   const rows = (data ?? []) as unknown as AnalysisArtifact[]
   const readyTools = registry.filter((t) => t.ready)
 
+  // เครื่องมือที่ใช้ได้กับแต่ละไฟล์ต้นทาง (ตรวจจากความพร้อมจริงและชนิดไฟล์ที่ระบบตรวจเอง)
+  const toolsByArtifact: Record<string, { id: string; name: string }[]> = {}
+  for (const a of rows) {
+    if (a.kind !== 'source') continue
+    const kind = (a.metadata.detected_kind ?? 'unknown') as Parameters<typeof supportsKind>[1]
+    toolsByArtifact[a.id] = readyTools.filter((t) => supportsKind(t, kind)).map((t) => ({ id: t.id, name: t.name }))
+  }
+
   return (
     <div>
       <ArtifactUploader sessionId={sessionId} />
       {rows.length === 0 ? (
         <EmptyState title="ยังไม่มี Artifact">
-          อัปโหลดไฟล์ต้นทางเพื่อเริ่มวิเคราะห์ ผลลัพธ์ที่เครื่องมือสร้างจะแสดงที่นี่พร้อม hash
+          แตะปุ่ม + เพื่ออัปโหลดไฟล์ต้นทางและเริ่มวิเคราะห์ ผลลัพธ์ที่เครื่องมือสร้างจะแสดงที่นี่พร้อม hash
         </EmptyState>
       ) : (
-        <ul className={`${CARD} divide-y divide-neutral-800`}>
-          {rows.map((a) => {
-            const kind = a.metadata.detected_kind
-            const tools =
-              a.kind === 'source'
-                ? readyTools.filter((t) => supportsKind(t, (kind ?? 'unknown') as Parameters<typeof supportsKind>[1]))
-                : []
-            return (
-              <li key={a.id} className="px-4 py-3">
-                <p className="break-all text-sm text-neutral-200">{a.name}</p>
-                <p className="mt-0.5 text-xs text-neutral-500">
-                  {ARTIFACT_KIND_LABELS[a.kind]}
-                  {a.metadata.detected_label ? ` · ${a.metadata.detected_label}` : ''} · {formatBytes(a.size_bytes)} ·
-                  SHA-256 {a.sha256.slice(0, 12)}… · {formatDateTime(a.created_at)}
-                </p>
-                {a.kind === 'tool_output' && (
-                  <a
-                    href={`/api/analysis/${sessionId}/artifacts/${a.id}/content`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="mt-2 inline-block text-xs text-indigo-400 hover:text-indigo-300"
-                  >
-                    ดูผลลัพธ์ (JSON)
-                  </a>
-                )}
-                {tools.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {tools.map((t) => (
-                      <RunToolButton
-                        key={t.id}
-                        sessionId={sessionId}
-                        artifactId={a.id}
-                        toolId={t.id}
-                        label={`วิเคราะห์ด้วย ${t.name}`}
-                      />
-                    ))}
-                  </div>
-                )}
-                {a.kind === 'source' && tools.length === 0 && (
-                  <p className="mt-2 text-xs text-neutral-500">ยังไม่มีเครื่องมือที่พร้อมและรองรับไฟล์ชนิดนี้</p>
-                )}
-              </li>
-            )
-          })}
-        </ul>
+        <ArtifactList sessionId={sessionId} artifacts={rows} toolsByArtifact={toolsByArtifact} />
       )}
     </div>
   )
