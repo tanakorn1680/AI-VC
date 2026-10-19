@@ -1,5 +1,6 @@
 import { fileIdentifyAdapter } from './tools/file-identify'
 import { zipInventoryAdapter } from './tools/zip-inventory'
+import { elfInspectAdapter } from './tools/elf-inspect'
 import type { DetectedKind, ToolAdapter, ToolDescriptor, ToolProbe } from './tool-adapter'
 
 /**
@@ -9,7 +10,7 @@ import type { DetectedKind, ToolAdapter, ToolDescriptor, ToolProbe } from './too
  * (installed / healthy / version) ไม่มี Adapter ใดถูกประกาศว่าพร้อมโดยไม่ผ่าน probe
  * เครื่องมือแบบ worker / mcp จะเพิ่มในระยะถัดไปเมื่อมีโครงสร้างพื้นฐานรองรับ
  */
-const ADAPTERS: readonly ToolAdapter[] = [fileIdentifyAdapter, zipInventoryAdapter]
+const ADAPTERS: readonly ToolAdapter[] = [fileIdentifyAdapter, zipInventoryAdapter, elfInspectAdapter]
 
 export interface RegistryEntry extends ToolDescriptor {
   installed: boolean
