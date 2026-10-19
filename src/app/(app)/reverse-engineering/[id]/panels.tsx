@@ -124,6 +124,14 @@ export async function OverviewPanel({
           locked={locked}
         />
         <div className="border-t border-neutral-800 pt-4">
+          <p className="mb-3 text-xs text-neutral-500">
+            Agent ที่จะใช้วิเคราะห์:{' '}
+            {(() => {
+              if (!session.analyst_agent_id) return 'ยังไม่ได้เลือก'
+              const a = agents.find((x) => x.id === session.analyst_agent_id)
+              return a ? `${a.name} · ${a.provider}/${a.model}` : 'ไม่พบ agent เดิม (อาจถูกลบแล้ว) กรุณาเลือกใหม่'
+            })()}
+          </p>
           <RunControls
             sessionId={session.id}
             status={session.status}

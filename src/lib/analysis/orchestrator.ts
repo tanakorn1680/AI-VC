@@ -247,6 +247,9 @@ export async function callModel(
       .eq('id', session.id)
   }
 
+  // ระบุ agent/โมเดลที่ถูกเรียกจริงในข้อความ error เสมอ (ผู้ใช้เลือก agent ใหม่แล้วอาจยังไม่ได้บันทึก จึงต้องเห็นว่าอะไรถูกใช้)
+  const label = `${analyst.name} · ${analyst.provider}/${analyst.model}`
+
   try {
     const result = await completeJson(analyst, prompt)
     await record(result.tokensIn, result.tokensOut)
@@ -255,10 +258,10 @@ export async function callModel(
     if (e instanceof AnalysisFormatError) {
       const t = e as AnalysisFormatError & { tokensIn?: number; tokensOut?: number }
       await record(t.tokensIn ?? 0, t.tokensOut ?? 0) // token ถูกใช้ไปจริงแม้ตอบผิดรูปแบบ
-      return { ok: false, outcome: { state: 'error', message: 'โมเดลตอบผิดรูปแบบ ลองใหม่อีกครั้ง หรือเปลี่ยนไปใช้โมเดลอื่น' } }
+      return { ok: false, outcome: { state: 'error', message: `โมเดลตอบผิดรูปแบบ ลองใหม่อีกครั้ง หรือเปลี่ยนไปใช้โมเดลอื่น [${label}]` } }
     }
     if (e instanceof InvalidApiKeyError || e instanceof InsufficientCreditError) {
-      const message = (e as Error).message
+      const message = `${(e as Error).message} [${label}]`
       if (!opts.keepStatus) {
         await admin.from('analysis_sessions').update({ status: 'failed', last_error: message.slice(0, 1000) }).eq('id', session.id)
       }
@@ -269,7 +272,7 @@ export async function callModel(
       return { ok: false, outcome: { state: 'waiting', message: 'โควตา AI เต็มชั่วคราว ระบบจะลองใหม่อัตโนมัติ', retryAfterSeconds: wait } }
     }
     console.error('[analysis] model call failed:', (e as Error).message)
-    return { ok: false, outcome: { state: 'error', message: `เรียก AI ไม่สำเร็จ: ${(e as Error).message}`.slice(0, 400) } }
+    return { ok: false, outcome: { state: 'error', message: `เรียก AI ไม่สำเร็จ [${label}]: ${(e as Error).message}`.slice(0, 700) } }
   }
 }
 

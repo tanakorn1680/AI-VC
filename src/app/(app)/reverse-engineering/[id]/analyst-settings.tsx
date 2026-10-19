@@ -32,34 +32,50 @@ export default function AnalystSettings({
   const router = useRouter()
   const [agent, setAgent] = useState(agentId ?? '')
   const [budget, setBudget] = useState(String(tokenBudget))
+  const [savingAgent, setSavingAgent] = useState(false)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
 
-  const dirty = agent !== (agentId ?? '') || Number(budget) !== tokenBudget
+  // agent บันทึกอัตโนมัติทันทีที่เลือก (กันเลือกแล้วลืมกดบันทึก แต่ระบบยังใช้ agent เดิม) ปุ่มบันทึกจึงใช้กับงบ token เท่านั้น
+  const dirty = Number(budget) !== tokenBudget
 
-  async function save(e: FormEvent) {
-    e.preventDefault()
-    if (busy || !dirty) return
-    setBusy(true)
+  async function patch(body: Record<string, unknown>): Promise<boolean> {
     setMessage(null)
     try {
       const res = await fetch(`/api/analysis/${sessionId}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ analyst_agent_id: agent || null, token_budget: Number(budget) }),
+        body: JSON.stringify(body),
       })
-      const body = (await res.json().catch(() => ({}))) as { error?: string }
+      const data = (await res.json().catch(() => ({}))) as { error?: string }
       if (!res.ok) {
-        setMessage({ kind: 'error', text: body.error ?? 'บันทึกไม่สำเร็จ' })
-      } else {
-        setMessage({ kind: 'ok', text: 'บันทึกแล้ว' })
-        router.refresh()
+        setMessage({ kind: 'error', text: data.error ?? 'บันทึกไม่สำเร็จ' })
+        return false
       }
+      setMessage({ kind: 'ok', text: 'บันทึกแล้ว' })
+      router.refresh()
+      return true
     } catch {
       setMessage({ kind: 'error', text: 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่อีกครั้ง' })
-    } finally {
-      setBusy(false)
+      return false
     }
+  }
+
+  async function changeAgent(next: string) {
+    const previous = agent
+    setAgent(next)
+    setSavingAgent(true)
+    const ok = await patch({ analyst_agent_id: next || null })
+    if (!ok) setAgent(previous) // บันทึกไม่สำเร็จ: คืนค่าให้ตรงกับที่ระบบใช้จริง
+    setSavingAgent(false)
+  }
+
+  async function save(e: FormEvent) {
+    e.preventDefault()
+    if (busy || !dirty) return
+    setBusy(true)
+    await patch({ token_budget: Number(budget) })
+    setBusy(false)
   }
 
   if (agents.length === 0) {
@@ -80,8 +96,8 @@ export default function AnalystSettings({
         <select
           id="analyst"
           value={agent}
-          onChange={(e) => setAgent(e.target.value)}
-          disabled={locked || busy}
+          onChange={(e) => void changeAgent(e.target.value)}
+          disabled={locked || busy || savingAgent}
           className={FIELD}
         >
           <option value="">— ยังไม่เลือก —</option>
@@ -115,7 +131,7 @@ export default function AnalystSettings({
           disabled={locked || busy || !dirty}
           className="rounded-md border border-neutral-700 px-4 py-1.5 text-sm text-neutral-200 transition hover:border-indigo-600 disabled:opacity-50"
         >
-          {busy ? 'กำลังบันทึก...' : 'บันทึกการตั้งค่า'}
+          {busy ? 'กำลังบันทึก...' : 'บันทึกงบ token'}
         </button>
         {message && (
           <span role={message.kind === 'error' ? 'alert' : 'status'} className={`text-sm ${message.kind === 'error' ? 'text-red-400' : 'text-emerald-400'}`}>
