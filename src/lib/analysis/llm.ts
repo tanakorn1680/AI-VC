@@ -2,6 +2,7 @@ import 'server-only'
 import { getAdapter } from '@/lib/ai/registry'
 import { completeWithRetry } from '@/lib/ai/retry'
 import { ProviderError } from '@/lib/ai/types'
+import { getProviderMeta } from '@/lib/ai/providers'
 import type { AnalystAgent } from './security'
 
 /** โมเดลตอบไม่เป็น JSON ตามที่กำหนดแม้ลองซ้ำแล้ว */
@@ -15,21 +16,38 @@ export interface JsonCompletion {
 
 const MIN_OUTPUT_TOKENS = 1024
 
+/** คำขอใหญ่เกินที่โมเดล/แพ็กเกจนี้รับได้ (ลดขาออกแล้วก็ยังไม่พอ) — ทีมใช้เป็นสัญญาณให้ส่งต่อให้ agent ที่ context ใหญ่กว่า */
+export class PromptTooLargeError extends ProviderError {
+  constructor(message: string, public limit?: number, public requested?: number) {
+    super(message, 413)
+  }
+}
+
 const looksTooLarge = (e: unknown): e is ProviderError =>
-  e instanceof ProviderError && (e.status === 413 || /request too large|reduce your message size/i.test(e.message))
+  e instanceof ProviderError &&
+  (e.status === 413 || /request too large|reduce your message size|maximum context length|context length exceeded/i.test(e.message))
+
+/** ดึงเพดาน/ยอดที่ขอจากข้อความ error ของ provider (Groq: "Limit 8000, Requested 9243"; OpenAI-style: "maximum context length is N tokens ... requested M") */
+export function parseTokenLimit(message: string): { limit?: number; requested?: number } {
+  const groq = /Limit (\d+), Requested (\d+)/i.exec(message)
+  if (groq) return { limit: Number(groq[1]), requested: Number(groq[2]) }
+  const ctx = /maximum context length is (\d+) tokens[\s\S]*?(?:requested|resulted in|you requested)\D{0,20}(\d+)/i.exec(message)
+  if (ctx) return { limit: Number(ctx[1]), requested: Number(ctx[2]) }
+  const only = /maximum context length is (\d+)/i.exec(message)
+  return only ? { limit: Number(only[1]) } : {}
+}
 
 /**
- * provider บางเจ้า (เช่น Groq แพ็กเกจฟรี) นับ "จำนวน token ขาออกที่ขอไว้ (max tokens)" รวมในขนาดคำขอ
- * ถ้า error บอกเพดานกับยอดที่ขอ (Limit N, Requested M) และลดขาออกลงแล้วจะพอดี คืนค่าขาออกใหม่ ไม่งั้น null
+ * provider บางเจ้า (เช่น Groq แพ็กเกจฟรี) นับ "จำนวน token ขาออกที่ขอไว้ (max_tokens)" รวมในขนาดคำขอ
+ * ถ้า error บอกเพดานกับยอดที่ขอ และลด max_tokens ที่ส่งจริงลงแล้วจะพอดี คืนค่า max_tokens ใหม่ ไม่งั้น null
+ * sentNow = ค่า max_tokens ที่ส่งไปจริงในคำขอที่พลาด (รวม headroom แล้ว)
  * เหลือขาออกต่ำสุด 1,024 เพื่อไม่ให้คำตอบ JSON ถูกตัดกลางคัน
  */
-export function shrunkOutputTokens(err: unknown, current: number): number | null {
+export function shrunkOutputTokens(err: unknown, sentNow: number): number | null {
   if (!looksTooLarge(err)) return null
-  const m = /Limit (\d+), Requested (\d+)/i.exec(err.message)
-  if (!m) return null
-  const limit = Number(m[1]), requested = Number(m[2])
-  if (!(requested > limit)) return null
-  const next = current - (requested - limit) - 256 // เผื่อส่วนต่างของการนับ token
+  const { limit, requested } = parseTokenLimit(err.message)
+  if (limit === undefined || requested === undefined || !(requested > limit)) return null
+  const next = sentNow - (requested - limit) - 256 // เผื่อส่วนต่างของการนับ token
   return next >= MIN_OUTPUT_TOKENS ? next : null
 }
 
@@ -53,12 +71,17 @@ function extractJson(text: string): Record<string, unknown> | null {
  */
 export async function completeJson(
   analyst: AnalystAgent,
-  prompt: { system: string; user: string; maxTokens: number }
+  prompt: { system: string; user: string; maxTokens: number; outputCap?: number }
 ): Promise<JsonCompletion> {
   const adapter = getAdapter(analyst.provider)
+  const headroom = getProviderMeta(analyst.provider)?.outputHeadroom ?? 0
   let currentMax = Math.min(Math.max(prompt.maxTokens, MIN_OUTPUT_TOKENS), analyst.max_tokens ?? prompt.maxTokens)
+  let cap = prompt.outputCap
   let tokensIn = 0
   let tokensOut = 0
+
+  // max_tokens ที่ adapter จะส่งจริง (รวม headroom ของ provider ที่คิดก่อนตอบ และเพดานที่กำหนด)
+  const sentNow = () => Math.min(headroom > 0 ? Math.min(currentMax + headroom, 32768) : currentMax, cap ?? Number.MAX_SAFE_INTEGER)
 
   // เรียก provider หนึ่งครั้ง: ถ้าคำขอใหญ่เกินเพดานของโมเดลและลดขาออกแล้วพอดี จะลดแล้วลองใหม่ได้ 1 ครั้ง
   let shrunkOnce = false
@@ -71,21 +94,23 @@ export async function completeJson(
           systemPrompt: prompt.system,
           userPrompt,
           maxTokens: currentMax,
+          outputCap: cap,
           baseUrl: analyst.base_url ?? undefined,
         })
       } catch (e) {
-        const next = shrunkOnce ? null : shrunkOutputTokens(e, currentMax)
+        const next = shrunkOnce ? null : shrunkOutputTokens(e, sentNow())
         if (next !== null) {
-          currentMax = next
+          cap = next
+          currentMax = Math.min(currentMax, next)
           shrunkOnce = true
           continue
         }
         if (looksTooLarge(e)) {
-          const lim = /Limit (\d+), Requested (\d+)/i.exec(e.message)
-          throw new ProviderError(
-            `คำขอใหญ่เกินขีดจำกัดของโมเดลนี้${lim ? ` (จำกัด ${lim[1]} โทเคน แต่ต้องใช้ ${lim[2]})` : ''} ลดข้อมูลลงอีกไม่ได้ — ` +
-              'เลือก agent ที่ใช้โมเดลซึ่งรับโทเคนได้มากกว่านี้ หรืออัปเกรดแพ็กเกจของ provider',
-            413
+          const { limit, requested } = parseTokenLimit(e.message)
+          throw new PromptTooLargeError(
+            `คำขอใหญ่เกินขีดจำกัดของโมเดลนี้${limit ? ` (จำกัด ${limit} โทเคน${requested ? ` แต่ต้องใช้ ${requested}` : ''})` : ''}`,
+            limit,
+            requested
           )
         }
         throw e

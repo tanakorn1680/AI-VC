@@ -36,7 +36,10 @@ export function openaiCompatibleAdapter(
         body: JSON.stringify({
           model: req.model,
           // รุ่นที่คิดก่อนตอบ (เช่น GLM) นับ token คิดรวมในเพดานนี้ — เผื่อ headroom (ไม่เกิน 32768)
-          max_tokens: outputHeadroom > 0 ? Math.min(req.maxTokens + outputHeadroom, 32768) : req.maxTokens,
+          max_tokens: Math.min(
+            outputHeadroom > 0 ? Math.min(req.maxTokens + outputHeadroom, 32768) : req.maxTokens,
+            req.outputCap !== undefined ? Math.max(256, req.outputCap) : Number.MAX_SAFE_INTEGER
+          ),
           messages: [
             { role: 'system', content: req.systemPrompt },
             { role: 'user', content: req.userPrompt },

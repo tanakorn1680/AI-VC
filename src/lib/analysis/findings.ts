@@ -36,23 +36,39 @@ ${UNTRUSTED_RULES}
 - confidence เป็นเพียงข้อเสนอ ระบบจะคำนวณระดับจริงจากหลักฐานที่ตรวจผ่านแล้ว
 - needs_more ใช้เมื่อยังมี artifact ที่ยังไม่ถูกตรวจด้วยเครื่องมือที่รองรับ มิฉะนั้นให้เป็น []`
 
+export interface FindingsPromptOptions {
+  /** ตัวอักษรที่ให้อ่านต่อ run (โหมดทีม: แบ่งตามความจุของ agent แต่ละตัว) — ไม่ระบุ = ใช้เพดานเดิม */
+  slices?: Map<string, number>
+  /** บอกโมเดลว่านี่เป็นชุดย่อย เพื่อไม่ให้สรุปเกินขอบเขตข้อมูลที่เห็น */
+  shardNote?: string
+}
+
+/** กติกาเพิ่มสำหรับชุดย่อย: จำกัดจำนวนข้อค้นพบให้พอดีกับเพดานคำตอบของ agent ตัวนั้น */
+export const findingsSystemPrompt = (maxFindings?: number): string =>
+  maxFindings ? `${FINDINGS_SYSTEM_PROMPT}\n- เขียน findings ไม่เกิน ${maxFindings} รายการ (เลือกที่สำคัญที่สุด) ข้อความกระชับ` : FINDINGS_SYSTEM_PROMPT
+
 export function buildFindingsPrompt(
   goal: string,
   runs: RunOutput[],
-  uninspected: { artifact_id: string; name: string; supported_tools: string[] }[]
+  uninspected: { artifact_id: string; name: string; supported_tools: string[] }[],
+  opts: FindingsPromptOptions = {}
 ): string {
   let budget = MAX_TOTAL_CHARS
   const blocks = runs.map((r) => {
-    const slice = r.fullText.slice(0, Math.min(MAX_OUTPUT_CHARS_PER_RUN, Math.max(budget, 500)))
+    const limit = opts.slices?.get(r.runId) ?? Math.min(MAX_OUTPUT_CHARS_PER_RUN, Math.max(budget, 500))
+    const slice = r.fullText.slice(0, limit)
     budget -= slice.length
     const truncated = slice.length < r.fullText.length ? '\n[ตัดผลลัพธ์ส่วนที่เหลือเพื่อประหยัด token]' : ''
     return `run_id: ${r.runId}\ntool_id: ${r.toolId}\ninput_file: ${r.artifactName}\n${wrapUntrusted(`tool-output:${r.runId}`, slice + truncated)}`
   })
   return [
     `เป้าหมายของผู้ใช้:\n${goal || '(ผู้ใช้ไม่ได้ระบุ — สรุปโครงสร้างโดยรวมของไฟล์)'}`,
+    opts.shardNote ? `หมายเหตุ: ${opts.shardNote}` : '',
     `runs (ผลของเครื่องมือที่รันสำเร็จ):\n\n${blocks.join('\n\n---\n\n')}`,
-    `artifacts ที่ยังไม่ถูกตรวจด้วยเครื่องมือที่รองรับ:\n${wrapUntrusted('uninspected', JSON.stringify(uninspected, null, 2))}`,
-  ].join('\n\n')
+    uninspected.length > 0
+      ? `artifacts ที่ยังไม่ถูกตรวจด้วยเครื่องมือที่รองรับ:\n${wrapUntrusted('uninspected', JSON.stringify(uninspected, null, 2))}`
+      : 'artifacts ที่ยังไม่ถูกตรวจด้วยเครื่องมือที่รองรับ: (ไม่มี)',
+  ].filter(Boolean).join('\n\n')
 }
 
 export interface VerifiedEvidence {

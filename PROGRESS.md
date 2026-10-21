@@ -6,7 +6,7 @@
 ## 1. โปรเจกต์คืออะไร
 Multi-Agent AI Workspace — Next.js (App Router) + Supabase + Vercel, BYOK (ผู้ใช้ใส่ API key เอง)
 ผู้ใช้คุยกับ "หัวหน้าทีม" AI → เสนอแผน → ผู้ใช้กดยืนยัน → งานกระจายไปให้ AI สมาชิกผ่าน queue (dependency + parallel)
-มีโหมด Reverse Engineering แยก (`/reverse-engineering`) ไม่เกี่ยวกับงานทีม ยกเว้นยืม agent เป็นนักวิเคราะห์
+มีโหมด Reverse Engineering แยก (`/reverse-engineering`) — ใช้ "ทีม AI" กลางชุดเดียวกัน ทั้งทีมทำงานพร้อมกัน (ดู 4.4)
 รายละเอียดติดตั้ง/รัน: `README.md`
 
 ## 2. เป้าหมายของงานรอบนี้ (จากผู้ใช้ "Gg")
@@ -15,6 +15,7 @@ Multi-Agent AI Workspace — Next.js (App Router) + Supabase + Vercel, BYOK (ผ
 3. แบ่งงานให้มีประสิทธิภาพที่สุด (อ้างอิงภาพ "LTD OS": ผู้ประสานงานแค่ส่งงาน ไม่ลงมือเอง → ผู้เชี่ยวชาญทำ → ผู้ตรวจ/ผู้ตรวจข้อเท็จจริง → ความจำป้อนกลับ)
 4. **context ต้องไม่บวม** (แชทยาว = AI แย่ลง) และ AI ต้อง **รีเฟรชตัวเองได้**
 5. ดูโปรเฟสชันนัลขึ้น
+6. (รอบ 2) **Reverse Engineering ต้องใช้ AI หลายตัวพร้อมกันเป็นทีม** ไม่ใช่เลือกทีละตัว + ไม่พังเมื่อโมเดลรับ context ได้น้อย (ตัวอย่างจริง: Groq gpt-oss-120b จำกัด 8,000 โทเคน/คำขอ แล้วฟ้อง "ต้องใช้ 9,243")
 
 ## 3. กติกาการทำงานของผู้ใช้ (ต้องทำตาม)
 - ส่งงานเป็น **zip เฉพาะไฟล์ที่แก้/เพิ่ม** แตกทับ root ของ repo ได้เลย (path ตรงโครงสร้าง **ไม่มีโฟลเดอร์ครอบ**) + ไฟล์นี้ (PROGRESS.md) ทุกครั้ง
@@ -50,6 +51,16 @@ Multi-Agent AI Workspace — Next.js (App Router) + Supabase + Vercel, BYOK (ผ
 - ทีมมีผู้ตรวจ → ชิ้นงานสำคัญเพิ่มงานตรวจ; ทีมมีคนเดียว → มอบงานให้ตัวเอง (ได้ context สะอาดต่อ task)
 - worker ปิดท้ายด้วย `<summary>…</summary>` (≤400 ตัวอักษร) — `splitSummary()`; ไม่มี → fallback ตัด 800 ตัวอักษร
 
+### 4.4 RE แบบทีม (รอบ 2 — **ไม่มี migration ใหม่**)
+- **สาเหตุบั๊ก Groq 8k**: adapter openai-compatible บวก `outputHeadroom` 8192 เข้า `max_tokens` (ให้รุ่นคิดก่อนตอบ) แต่ Groq นับ max_tokens รวมในเพดานคำขอ → เกิน 8,000 เสมอ ลดแล้วก็ไม่พอ. แก้: `CompletionRequest.outputCap` (เพดาน max_tokens จริง) + `completeJson` คำนวณ headroom ตอนลด
+- **Pool** (`lib/analysis/team-pool.ts`): ใช้ agent ทุกตัวในทีมที่มี key; ทีมเลือกที่ `analysis_sessions.config.team_id` (ไม่ตั้ง = ทีมแรกที่มี agent; งานเก่าที่มี `analyst_agent_id` = ทีมของ agent นั้น). แต่ละตัวมี `inputLimit` (prompt+max_tokens) — เดาจาก provider/โมเดล (`guessRequestLimit`) แล้ว **เรียนรู้จาก error จริง** เก็บที่ `config.agent_limits[agentId]`
+- **แบ่งงาน**: `planWave` แบ่งผลเครื่องมือเป็นชุดย่อยตามความจุของแต่ละตัว (สูงสุด 4 ตัวขนาน, first-fit-decreasing) ; ตัวใหญ่ได้ชุดใหญ่ ตัวเล็กได้ชุดเล็ก; เพดานต่อคำขอ 60k โทเคน (context ไม่บวม)
+- **ส่งต่ออัตโนมัติ** (`callModel` ใน `orchestrator.ts`): ชนเพดาน → จำเพดานแล้วส่งตัวที่ใหญ่กว่า; rate limit / ตอบผิดรูปแบบ / provider error → ตัวอื่นในทีม; key ผิด/เครดิตหมด → ข้ามตัวนั้น (ทั้งทีมพังค่อยหยุด). ยอด token/ค่าใช้จ่ายนับตาม agent ที่เรียกจริง
+- **บทบาท**: manager = วางแผนอย่างเดียว (`prefer:'lead'`), ผู้เชี่ยวชาญ = อ่านผลคนละชุดขนานกัน, reviewer = ตรวจทานข้อค้นพบรวม (`team-review.ts`: ลด/ตัดได้อย่างเดียว ตัดไม่เกินครึ่ง ข้อที่ตัดถูกบันทึกเป็น limitation) ; หลักฐาน/ความเชื่อมั่นยังตัดสินโดยระบบ (`evidence.ts`) เหมือนเดิม
+- **สถานะต่อเนื่อง**: `config.analysis = {done, needs_more, reviewed, wave}` — สรุปทีละ wave ต่อ step (หยุดแล้วทำต่อได้) ; ชุดที่พลาดถูกลองใหม่ wave ถัดไป ; จบแล้วลบชื่อซ้ำ → รีวิว → (ถ้าต้อง) รอบเสริม → completed
+- UI: `analyst-settings.tsx` ไม่มี dropdown เลือก agent แล้ว — แสดงสมาชิกทีม+เพดานของแต่ละตัว (เลือกทีมได้ถ้ามีหลายทีม)
+- ไม่ต้องล็อกทีม (RE ไม่ใช่โปรเจกต์) — ทีมที่ประจำโปรเจกต์อยู่ใช้ทำ RE พร้อมกันได้ (ระวัง rate limit ร่วมกัน)
+
 ## 5. แผนที่ไฟล์ที่เกี่ยวข้อง
 ```
 supabase/migrations/0010_shared_teams.sql      teams, agents.team_id, acquire/release_team, project_memory
@@ -65,15 +76,18 @@ src/app/api/projects/[id]/team|memory          ทีมของโปรเจ
 src/app/(app)/team/**                          หน้าจัดการทีมทั้งหมด (/team)
 src/app/(app)/projects/[id]/                   workspace-client (แท็บ ความจำ, แบนเนอร์ทีม), agents-panel (apiBase), team-banner, memory-panel
 ```
+RE ทีม (รอบ 2): `lib/analysis/team-pool.ts` (pool/เพดาน/แบ่งชุด), `team-review.ts` (ผู้ตรวจทาน), `orchestrator.ts` (callModel แบบทีม, analyzeWave, finalizeAnalysis), `llm.ts` (PromptTooLargeError, headroom-aware), `findings.ts` (prompt ชุดย่อย), `report-service.ts`, `api/analysis/[id]/route.ts` (PATCH `analyst_team_id` → config.team_id), `lib/ai/openai-compatible.ts`+`types.ts` (`outputCap`), UI `reverse-engineering/[id]/analyst-settings.tsx`+`panels.tsx`
 แก้เล็กน้อย: `lib/analysis/security.ts` + `reverse-engineering/[id]/panels.tsx` (agent ตรวจสิทธิ์ผ่านทีม), `api/projects/[id]/usage` (agent ทั้งหมดของผู้ใช้),
 `lib/utils/api.ts` (+`CONFLICT` 409), `lib/supabase/middleware.ts` (+`/team`)
 
 ## 6. สถานะ (อัปเดตล่าสุด 2026-10-21)
 - [x] ออกแบบ + เขียนโค้ดครบตามเป้าหมายข้อ 2 (1–4) (SQL, lib, API, UI, README)
 - [x] ตรวจ syntax ทุกไฟล์ .ts/.tsx ผ่าน (TypeScript transpile) — **ยังไม่ได้ `npm install`/`next build`/รัน SQL/ยิง AI จริง** (ผู้ใช้สั่งไม่ต้องทดสอบ)
+- [x] รอบ 2: RE แบบทีม (ดู 4.4) เขียนครบ ตรวจ syntax ผ่าน — ยังไม่ได้ยิง AI จริง
 - `next.config.ts` ตั้ง `ignoreBuildErrors: true` อยู่ (โค้ดเดิมมี type ไม่ตรง supabase-js ~30 จุด) — โค้ดใหม่เขียนแบบ cast เหมือน `lead.ts` เพื่อไม่เพิ่ม error
 
 ## 7. ขั้นตอนใช้งานหลังแตก zip ทับ
+0. (รอบ 2 ไม่มี SQL ใหม่)
 1. Supabase SQL Editor: รัน `supabase/migrations/0010_shared_teams.sql` (**ก่อน deploy** เพราะโค้ดอ่าน `teams`/`agents.team_id`/`project_memory`; รันซ้ำได้)
 2. Deploy ตามปกติ (ไม่มี env ใหม่)
 3. เข้า `/team` ตรวจว่า agent เดิมอยู่ใน "ทีมหลัก" (ชื่อซ้ำจะมี (2)(3)) ลบตัวซ้ำที่ไม่ต้องการ
@@ -86,6 +100,10 @@ src/app/(app)/projects/[id]/                   workspace-client (แท็บ �
 - ผู้ตรวจ → ถ้า summary ขึ้นต้น "ต้องแก้" ให้ระบบวนแก้อัตโนมัติ (ตอนนี้แค่รายงานในแชท ผู้ใช้/หัวหน้าตัดสินต่อ)
 - ตัว `estimateTokens` เป็นการประมาณ (ไทย ≈1.6 ตัวอักษร/token) ปรับตามผลใช้งานจริงได้ใน `context-budget.ts`
 - `agents.project_id` (nullable, ไม่ใช้แล้ว) ลบได้ในอนาคตเมื่อมั่นใจ; `lib/orchestrator/planner.ts` เป็นโค้ดเก่าที่ไม่ถูกเรียกแล้ว
+
+- RE: เพดานเริ่มต้นของ Groq ตั้งไว้ 6–8k (แพ็กเกจจ่ายเงินสูงกว่านั้น แต่ระบบไม่ปรับขึ้นเอง) — ถ้าต้องการ ให้เพิ่มช่องตั้ง "เพดานคำขอ" ต่อ agent
+- RE: ผู้ตรวจทานตรวจได้ ≤40 ข้อค้นพบต่อรอบ และถ้าทั้งทีมเล็กเกินจะข้ามรีวิว; spec/report (`report-service.ts`) ยังเรียกตัวเดียว (เลือกตัวใหญ่สุด) ไม่แบ่งชุด
+- `analyst_agent_id` ยังอยู่ใน DB/API เพื่อความเข้ากันได้ย้อนหลัง แต่ UI ไม่ใช้แล้ว
 
 ## 9. ข้อควรระวัง
 - ห้ามให้ browser เรียก `acquire_team/release_team/set_agent_key/...` ตรง ๆ (revoke จาก authenticated แล้ว) — ผ่าน API route + admin client หลังตรวจสิทธิ์ด้วย RLS เสมอ

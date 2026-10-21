@@ -20,7 +20,8 @@ import {
   type AnalysisReport,
   type AnalysisTask,
 } from '@/lib/analysis/types'
-import AnalystSettings, { type AgentOption } from './analyst-settings'
+import AnalystSettings, { type TeamView } from './analyst-settings'
+import { memberLimit } from '@/lib/analysis/team-pool'
 import RunControls from './run-controls'
 import ArtifactUploader from './artifact-uploader'
 import { CreateDocButton, DownloadButton } from './report-actions'
@@ -47,20 +48,41 @@ const TASK_TONE: Record<string, string> = {
   cancelled: 'border-neutral-800 bg-neutral-900 text-neutral-500',
 }
 
-async function loadAgentOptions(supabase: Db): Promise<AgentOption[]> {
-  // RLS ของ agents/teams กรองให้เห็นเฉพาะของผู้ใช้เอง — agent เป็นของ "ทีม" (ใช้ร่วมกันทุกโปรเจกต์)
-  const [{ data: agents }, { data: teams }] = await Promise.all([
-    supabase.from('agents').select('id, name, provider, model, team_id').order('created_at', { ascending: false }).limit(100),
-    supabase.from('teams').select('id, name').limit(50),
+/** ทีม AI ที่งานนี้จะใช้ (ตรรกะเดียวกับ loadAnalystPool) + สมาชิกและเพดานคำขอของแต่ละตัว */
+async function loadTeamView(supabase: Db, sessionId: string, legacyAgentId: string | null): Promise<TeamView> {
+  // RLS ของ teams/agents กรองให้เห็นเฉพาะของผู้ใช้เอง — agent เป็นของ "ทีม" ใช้ร่วมกันทุกโปรเจกต์
+  const [{ data: teamData }, { data: agentData }, { data: cfgRow }] = await Promise.all([
+    supabase.from('teams').select('id, name').order('created_at', { ascending: true }).limit(50),
+    supabase.from('agents').select('id, name, provider, model, role, team_id').order('created_at', { ascending: true }).limit(300),
+    supabase.from('analysis_sessions').select('config').eq('id', sessionId).maybeSingle(),
   ])
-  const names = new Map(((teams ?? []) as { id: string; name: string }[]).map((t) => [t.id, t.name]))
-  return ((agents ?? []) as { id: string; name: string; provider: string; model: string; team_id: string }[]).map((a) => ({
-    id: a.id,
-    name: a.name,
-    provider: a.provider,
-    model: a.model,
-    projectName: names.get(a.team_id) ?? '-',
-  }))
+  const teams = (teamData ?? []) as { id: string; name: string }[]
+  const agents = (agentData ?? []) as { id: string; name: string; provider: string; model: string; role: string; team_id: string }[]
+  const config = ((cfgRow as { config?: { team_id?: string | null; agent_limits?: Record<string, number> } | null } | null)?.config ?? {})
+
+  const count = new Map<string, number>()
+  for (const a of agents) count.set(a.team_id, (count.get(a.team_id) ?? 0) + 1)
+
+  const selected = config.team_id && teams.some((t) => t.id === config.team_id) ? config.team_id : null
+  const legacyTeam = legacyAgentId ? agents.find((a) => a.id === legacyAgentId)?.team_id ?? null : null
+  const resolved =
+    selected ??
+    (legacyTeam && teams.some((t) => t.id === legacyTeam) ? legacyTeam : null) ??
+    teams.find((t) => (count.get(t.id) ?? 0) > 0)?.id ??
+    teams[0]?.id ??
+    null
+
+  return {
+    teams: teams.map((t) => ({ id: t.id, name: t.name, agentCount: count.get(t.id) ?? 0 })),
+    selectedTeamId: selected,
+    resolvedTeamId: resolved,
+    members: agents
+      .filter((a) => a.team_id === resolved)
+      .map((a) => ({
+        id: a.id, name: a.name, provider: a.provider, model: a.model, role: a.role,
+        limit: memberLimit(a.provider, a.model, a.id, config.agent_limits),
+      })),
+  }
 }
 
 export async function OverviewPanel({
@@ -72,8 +94,8 @@ export async function OverviewPanel({
   counts: AnalysisCounts
   supabase: Db
 }) {
-  const [agents, { data: taskData }] = await Promise.all([
-    loadAgentOptions(supabase),
+  const [teamView, { data: taskData }] = await Promise.all([
+    loadTeamView(supabase, session.id, session.analyst_agent_id),
     supabase.from('analysis_tasks').select(TASK_COLUMNS).eq('session_id', session.id).order('created_at', { ascending: true }).limit(50),
   ])
   const tasks = (taskData ?? []) as unknown as AnalysisTask[]
@@ -118,20 +140,11 @@ export async function OverviewPanel({
         <h2 className="text-sm font-medium text-neutral-300">การวิเคราะห์ด้วย AI</h2>
         <AnalystSettings
           sessionId={session.id}
-          agents={agents}
-          agentId={session.analyst_agent_id}
+          view={teamView}
           tokenBudget={session.token_budget}
           locked={locked}
         />
         <div className="border-t border-neutral-800 pt-4">
-          <p className="mb-3 text-xs text-neutral-500">
-            Agent ที่จะใช้วิเคราะห์:{' '}
-            {(() => {
-              if (!session.analyst_agent_id) return 'ยังไม่ได้เลือก'
-              const a = agents.find((x) => x.id === session.analyst_agent_id)
-              return a ? `${a.name} · ${a.provider}/${a.model}` : 'ไม่พบ agent เดิม (อาจถูกลบแล้ว) กรุณาเลือกใหม่'
-            })()}
-          </p>
           <RunControls
             sessionId={session.id}
             status={session.status}
@@ -153,7 +166,7 @@ export async function OverviewPanel({
         <h2 className="mb-2 text-sm font-medium text-neutral-300">แผนการวิเคราะห์</h2>
         {tasks.length === 0 ? (
           <EmptyState title="ยังไม่มีแผน">
-            เลือก agent อัปโหลดไฟล์ที่แท็บ Artifacts แล้วกดเริ่มวิเคราะห์ AI จะวางแผนโดยเลือกจากเครื่องมือที่พร้อมใช้งานจริงเท่านั้น
+            อัปโหลดไฟล์ที่แท็บ Artifacts แล้วกดเริ่มวิเคราะห์ ทีม AI จะวางแผนโดยเลือกจากเครื่องมือที่พร้อมใช้งานจริงเท่านั้น
           </EmptyState>
         ) : (
           <ul className={`${CARD} divide-y divide-neutral-800`}>

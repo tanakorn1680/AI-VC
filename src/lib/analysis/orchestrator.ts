@@ -4,8 +4,19 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { calculateCost } from '@/lib/orchestrator/pricing'
 import { InsufficientCreditError, InvalidApiKeyError, RateLimitError } from '@/lib/ai/types'
-import { AnalysisFormatError, completeJson, type JsonCompletion } from './llm'
-import { loadAnalyst, type AnalystAgent } from './security'
+import { estimateTokens } from '@/lib/orchestrator/context-budget'
+import { AnalysisFormatError, PromptTooLargeError, completeJson, type JsonCompletion } from './llm'
+import {
+  PER_CALL_TOKEN_CAP,
+  largestLimit,
+  loadAnalystPool,
+  orderPool,
+  outputBudgetFor,
+  planWave,
+  type PoolMember,
+  type PoolPrefer,
+} from './team-pool'
+import { REVIEW_SYSTEM_PROMPT, buildReviewPrompt, limitationTitleForDrop, parseVerdicts } from './team-review'
 import { getRegistry, supportsKind } from './tool-registry'
 import type { DetectedKind } from './tool-adapter'
 import { runTool } from './tool-runner'
@@ -20,7 +31,14 @@ import {
   type PlannedTask,
 } from './planner'
 import type { ArtifactKind } from './types'
-import { FINDINGS_SYSTEM_PROMPT, buildFindingsPrompt, processFindings, type RunOutput } from './findings'
+import {
+  FINDINGS_SYSTEM_PROMPT,
+  buildFindingsPrompt,
+  findingsSystemPrompt,
+  processFindings,
+  type ProcessedFindings,
+  type RunOutput,
+} from './findings'
 
 /**
  * Orchestrator ของ Reverse Engineering Mode — ทำงานทีละ "step" แล้วคืนผลให้ผู้เรียกเรียกซ้ำ
@@ -43,7 +61,7 @@ export type StepOutcome =
   | { state: 'busy'; message: string }
   | { state: 'error'; message: string }
 
-const LOCK_SECONDS = 90
+const LOCK_SECONDS = 150
 const STALE_TASK_MS = 3 * 60 * 1000
 const MAX_EXTRA_ROUNDS = 1
 
@@ -57,7 +75,27 @@ export interface SessionRow {
   tokens_in: number
   tokens_out: number
   cost_usd: number
-  config: { rounds?: number; reanalyze?: boolean } | null
+  config: SessionConfig | null
+}
+
+/** สถานะการสรุปผลแบบทีม (หลาย agent ช่วยกันอ่านผลเครื่องมือคนละชุด) — อยู่ใน config เพื่อทำต่อได้หลังหยุดกลางทาง */
+export interface AnalysisState {
+  /** run ที่สรุปแล้วในรอบนี้ */
+  done: string[]
+  /** ข้อเสนอขอเครื่องมือเพิ่มจากทุกชุด (ยังไม่ผ่าน parsePlan) */
+  needs_more: unknown[]
+  reviewed: boolean
+  wave: number
+}
+
+export interface SessionConfig {
+  rounds?: number
+  reanalyze?: boolean
+  /** ทีมที่ผู้ใช้เลือก (ไม่มี = ทีมแรกที่มี agent) */
+  team_id?: string | null
+  /** เพดานคำขอที่เรียนรู้จาก error ของ provider ต่อ agent (token) */
+  agent_limits?: Record<string, number>
+  analysis?: AnalysisState
 }
 
 interface TaskRow {
@@ -136,9 +174,10 @@ export async function withSessionLease<T>(
 async function runStep(admin: SupabaseClient, session: SessionRow): Promise<StepOutcome> {
   const sid = session.id
 
-  // 1) ต้องมีนักวิเคราะห์ และมีไฟล์ต้นทาง
-  const analyst = await loadAnalyst(admin, session.analyst_agent_id, session.owner_id)
-  if (!analyst.ok) return { state: 'blocked', message: analyst.message }
+  // 1) ต้องมีทีมนักวิเคราะห์ (agent ในทีม AI ทั้งทีม) และมีไฟล์ต้นทาง
+  const poolRes = await loadAnalystPool(admin, session)
+  if (!poolRes.ok) return { state: 'blocked', message: poolRes.message }
+  const pool = poolRes.members
 
   const { data: artData } = await admin
     .from('analysis_artifacts')
@@ -183,7 +222,7 @@ async function runStep(admin: SupabaseClient, session: SessionRow): Promise<Step
   }
 
   // 3) เลือก step ถัดไป
-  if (tasks.length === 0) return planStep(admin, session, analyst.agent, sources)
+  if (tasks.length === 0) return planStep(admin, session, pool, sources)
 
   const byId = new Map(tasks.map((t) => [t.id, t]))
   // งานที่ต้องรอ dependency ซึ่งล้มเหลว/ถูกยกเลิก จะไม่มีวันรันได้ → ยกเลิกตาม
@@ -210,8 +249,9 @@ async function runStep(admin: SupabaseClient, session: SessionRow): Promise<Step
     .from('analysis_findings')
     .select('id', { count: 'exact', head: true })
     .eq('session_id', sid)
-  if ((findingCount ?? 0) === 0 || session.config?.reanalyze) {
-    return analyzeStep(admin, session, analyst.agent, sources)
+  // config.analysis = กำลังสรุปผลแบบทีมค้างอยู่ (ทำต่อจากเดิม)
+  if ((findingCount ?? 0) === 0 || session.config?.reanalyze || session.config?.analysis) {
+    return analyzeStep(admin, session, pool, sources)
   }
 
   await admin.from('analysis_sessions').update({ status: 'completed' }).eq('id', sid)
@@ -219,15 +259,61 @@ async function runStep(admin: SupabaseClient, session: SessionRow): Promise<Step
 }
 
 // ---------------------------------------------------------------------------
-// ตัวช่วยเรียกโมเดล: ตรวจงบ → เรียก → บันทึก token/ค่าใช้จ่าย → จัดการ error ของ provider
+// ตัวช่วยเรียกโมเดลของ "ทีม": ตรวจงบ → ลองสมาชิกตามลำดับ → บันทึก token/ค่าใช้จ่ายของตัวที่ถูกเรียกจริง → ส่งต่อตัวถัดไปเมื่อพลาด
+//   คำขอใหญ่เกินเพดานของตัวนั้น → จำเพดานที่เรียนรู้ไว้ แล้วส่งต่อตัวที่ใหญ่กว่า
+//   rate limit / ตอบผิดรูปแบบ / provider error → ส่งต่อตัวอื่นในทีม
+//   key ผิด / เครดิตหมด → ข้ามตัวนั้น (ถ้าทั้งทีมพังแบบนี้ค่อยหยุดงานและบอกผู้ใช้)
 // ---------------------------------------------------------------------------
+export interface CallOpts {
+  keepStatus?: boolean
+  /** บทบาทที่เหมาะกับงาน (ลำดับตัวที่จะลองก่อน) */
+  prefer?: PoolPrefer
+  /** สมาชิกที่ถูกมอบหมายงานนี้ไว้ก่อน (ตัวอื่นเป็นตัวสำรอง) */
+  first?: PoolMember
+}
+
+export type ModelCall =
+  | { ok: true; result: JsonCompletion; agent: PoolMember }
+  | { ok: false; outcome: StepOutcome }
+
+// เขียน session ทีละคำสั่งตามลำดับ (เรียกโมเดลขนานกันได้ แต่ยอด token/config ต้องไม่เขียนทับกันเอง)
+const writeChains = new WeakMap<SessionRow, Promise<unknown>>()
+function enqueueSessionWrite(admin: SupabaseClient, session: SessionRow, build: () => Record<string, unknown>) {
+  const prev = writeChains.get(session) ?? Promise.resolve()
+  const next = prev
+    .then(() => admin.from('analysis_sessions').update(build()).eq('id', session.id))
+    .then(() => undefined, () => undefined)
+  writeChains.set(session, next)
+  return next
+}
+
+/** แก้ config ใน memory แล้วเขียนลง DB (ใช้ค่าล่าสุด ณ ตอนเขียนจริง) */
+export async function saveConfig(
+  admin: SupabaseClient,
+  session: SessionRow,
+  patch: Partial<SessionConfig>,
+  extra: Record<string, unknown> = {}
+) {
+  session.config = { ...(session.config ?? {}), ...patch }
+  await enqueueSessionWrite(admin, session, () => ({ ...extra, config: session.config }))
+}
+
+/** เรียนรู้เพดานคำขอจริงของ agent จาก error ของ provider (เผื่อ 5% กันส่วนต่างการนับ token) */
+async function learnLimit(admin: SupabaseClient, session: SessionRow, m: PoolMember, limit: number) {
+  const next = Math.max(2_000, Math.floor(limit * 0.95))
+  m.inputLimit = next
+  await saveConfig(admin, session, { agent_limits: { ...(session.config?.agent_limits ?? {}), [m.id]: next } })
+}
+
+const labelOf = (m: PoolMember) => `${m.name} · ${m.provider}/${m.model}`
+
 export async function callModel(
   admin: SupabaseClient,
   session: SessionRow,
-  analyst: AnalystAgent,
+  pool: PoolMember[],
   prompt: { system: string; user: string; maxTokens: number },
-  opts: { keepStatus?: boolean } = {}
-): Promise<{ ok: true; result: JsonCompletion } | { ok: false; outcome: StepOutcome }> {
+  opts: CallOpts = {}
+): Promise<ModelCall> {
   const used = session.tokens_in + session.tokens_out
   if (used >= session.token_budget) {
     const message = `ใช้ token ครบงบที่ตั้งไว้ (${used.toLocaleString('en-US')} / ${session.token_budget.toLocaleString('en-US')}) เพิ่มงบแล้วกดทำต่อได้`
@@ -237,43 +323,76 @@ export async function callModel(
     return { ok: false, outcome: { state: 'blocked', message } }
   }
 
-  const record = async (tokensIn: number, tokensOut: number) => {
-    const cost = await calculateCost(admin, analyst.provider, analyst.model, tokensIn, tokensOut).catch(() => 0)
+  const record = async (m: PoolMember, tokensIn: number, tokensOut: number) => {
+    const cost = await calculateCost(admin, m.provider, m.model, tokensIn, tokensOut).catch(() => 0)
     session.tokens_in += tokensIn
     session.tokens_out += tokensOut
     session.cost_usd = Number(session.cost_usd) + cost
-    await admin.from('analysis_sessions')
-      .update({ tokens_in: session.tokens_in, tokens_out: session.tokens_out, cost_usd: session.cost_usd })
-      .eq('id', session.id)
+    await enqueueSessionWrite(admin, session, () => ({
+      tokens_in: session.tokens_in, tokens_out: session.tokens_out, cost_usd: session.cost_usd,
+    }))
   }
 
-  // ระบุ agent/โมเดลที่ถูกเรียกจริงในข้อความ error เสมอ (ผู้ใช้เลือก agent ใหม่แล้วอาจยังไม่ได้บันทึก จึงต้องเห็นว่าอะไรถูกใช้)
-  const label = `${analyst.name} · ${analyst.provider}/${analyst.model}`
+  // ประมาณขนาด prompt (เผื่อ 10% เพราะนับ token แบบประมาณ)
+  const need = Math.ceil((estimateTokens(prompt.system) + estimateTokens(prompt.user)) * 1.1)
+  let waitSeconds: number | null = null
+  let fatal: string | null = null
+  let lastError: string | null = null
+  let tooBig = 0
 
-  try {
-    const result = await completeJson(analyst, prompt)
-    await record(result.tokensIn, result.tokensOut)
-    return { ok: true, result }
-  } catch (e) {
-    if (e instanceof AnalysisFormatError) {
-      const t = e as AnalysisFormatError & { tokensIn?: number; tokensOut?: number }
-      await record(t.tokensIn ?? 0, t.tokensOut ?? 0) // token ถูกใช้ไปจริงแม้ตอบผิดรูปแบบ
-      return { ok: false, outcome: { state: 'error', message: `โมเดลตอบผิดรูปแบบ ลองใหม่อีกครั้ง หรือเปลี่ยนไปใช้โมเดลอื่น [${label}]` } }
+  for (const m of orderPool(pool, opts.prefer ?? 'lead', opts.first)) {
+    const room = m.inputLimit - need // ที่เหลือให้คำตอบ (รวม headroom ของรุ่นที่คิดก่อนตอบ)
+    const maxTokens = Math.min(prompt.maxTokens, m.max_tokens ?? prompt.maxTokens, room - 100)
+    if (maxTokens < 1024) {
+      tooBig++
+      continue
     }
-    if (e instanceof InvalidApiKeyError || e instanceof InsufficientCreditError) {
-      const message = `${(e as Error).message} [${label}]`
-      if (!opts.keepStatus) {
-        await admin.from('analysis_sessions').update({ status: 'failed', last_error: message.slice(0, 1000) }).eq('id', session.id)
+    try {
+      const result = await completeJson(m, { ...prompt, maxTokens, outputCap: room })
+      await record(m, result.tokensIn, result.tokensOut)
+      return { ok: true, result, agent: m }
+    } catch (e) {
+      if (e instanceof AnalysisFormatError) {
+        const t = e as AnalysisFormatError & { tokensIn?: number; tokensOut?: number }
+        await record(m, t.tokensIn ?? 0, t.tokensOut ?? 0) // token ถูกใช้ไปจริงแม้ตอบผิดรูปแบบ
+        lastError = `โมเดลตอบผิดรูปแบบ [${labelOf(m)}]`
+      } else if (e instanceof PromptTooLargeError) {
+        await learnLimit(admin, session, m, e.limit ?? Math.floor(need * 0.7))
+        tooBig++
+      } else if (e instanceof InvalidApiKeyError || e instanceof InsufficientCreditError) {
+        fatal = `${(e as Error).message} [${labelOf(m)}]`
+      } else if (e instanceof RateLimitError) {
+        const w = Math.min(Math.max(e.retryAfterSeconds ?? 20, 5), 120)
+        waitSeconds = waitSeconds === null ? w : Math.min(waitSeconds, w)
+      } else {
+        console.error('[analysis] model call failed:', (e as Error).message)
+        lastError = `เรียก AI ไม่สำเร็จ [${labelOf(m)}]: ${(e as Error).message}`
       }
-      return { ok: false, outcome: { state: 'blocked', message } }
     }
-    if (e instanceof RateLimitError) {
-      const wait = Math.min(Math.max(e.retryAfterSeconds ?? 20, 5), 120)
-      return { ok: false, outcome: { state: 'waiting', message: 'โควตา AI เต็มชั่วคราว ระบบจะลองใหม่อัตโนมัติ', retryAfterSeconds: wait } }
-    }
-    console.error('[analysis] model call failed:', (e as Error).message)
-    return { ok: false, outcome: { state: 'error', message: `เรียก AI ไม่สำเร็จ [${label}]: ${(e as Error).message}`.slice(0, 700) } }
   }
+
+  // ทุกตัวในทีมพลาด — เลือกข้อความที่ช่วยผู้ใช้ตัดสินใจได้มากสุด
+  if (waitSeconds !== null) {
+    return { ok: false, outcome: { state: 'waiting', message: 'โควตา AI ของทีมเต็มชั่วคราว ระบบจะลองใหม่อัตโนมัติ', retryAfterSeconds: waitSeconds } }
+  }
+  if (fatal && !lastError && tooBig === 0) {
+    if (!opts.keepStatus) {
+      await admin.from('analysis_sessions').update({ status: 'failed', last_error: fatal.slice(0, 1000) }).eq('id', session.id)
+    }
+    return { ok: false, outcome: { state: 'blocked', message: fatal } }
+  }
+  if (!lastError && tooBig > 0) {
+    return {
+      ok: false,
+      outcome: {
+        state: 'error',
+        message:
+          `ไม่มี agent ในทีมที่รับคำขอขนาดนี้ได้ (ต้องใช้ราว ${need.toLocaleString('en-US')} โทเคน แต่ตัวที่ใหญ่สุดรับได้ ${largestLimit(pool).toLocaleString('en-US')}) — ` +
+          'เพิ่ม agent ที่ใช้โมเดล context ใหญ่ (เช่น Gemini / Claude) เข้าทีมที่เมนู "ทีม AI"',
+      },
+    }
+  }
+  return { ok: false, outcome: { state: 'error', message: (lastError ?? fatal ?? 'เรียก AI ไม่สำเร็จ').slice(0, 700) } }
 }
 
 const toPlanArtifacts = (sources: ArtifactRow[]): PlanArtifact[] =>
@@ -302,12 +421,12 @@ async function insertTasks(admin: SupabaseClient, sessionId: string, planned: Pl
 }
 
 // ---------------------------------------------------------------------------
-// PLAN
+// PLAN: ผู้นำทีม (manager) วางแผนอย่างเดียว ไม่ลงมือวิเคราะห์เอง
 // ---------------------------------------------------------------------------
 async function planStep(
   admin: SupabaseClient,
   session: SessionRow,
-  analyst: AnalystAgent,
+  pool: PoolMember[],
   sources: ArtifactRow[]
 ): Promise<StepOutcome> {
   const artifacts = toPlanArtifacts(sources)
@@ -316,16 +435,18 @@ async function planStep(
     (t) => t.ready && artifacts.some((a) => supportsKind(t, a.detected_kind as DetectedKind))
   )
   if (tools.length === 0) {
-    const message = 'ยังไม่มีเครื่องมือที่พร้อมใช้งานและรองรับไฟล์ที่อัปโหลด จึงยังวางแผนวิเคราะห์ไม่ได้'
+    const message = 'ยังไม่มีเครื่องมือที่พร้อมใช้งานและรองรับไฟล์ที่อัปโหลด จึงวางแผนวิเคราะห์ไม่ได้'
     await admin.from('analysis_sessions').update({ status: 'awaiting_tools', last_error: message }).eq('id', session.id)
     return { state: 'blocked', message }
   }
 
-  const called = await callModel(admin, session, analyst, {
-    system: PLAN_SYSTEM_PROMPT,
-    user: buildPlanPrompt(session.goal, artifacts, tools),
-    maxTokens: 3000,
-  })
+  const called = await callModel(
+    admin,
+    session,
+    pool,
+    { system: PLAN_SYSTEM_PROMPT, user: buildPlanPrompt(session.goal, artifacts, tools), maxTokens: 3000 },
+    { prefer: 'lead' }
+  )
   if (!called.ok) return called.outcome
 
   const { tasks, dropped } = parsePlan(called.result.value.tasks, {
@@ -342,7 +463,7 @@ async function planStep(
   await admin.from('analysis_sessions').update({ status: 'running' }).eq('id', session.id)
   return {
     state: 'continue',
-    message: `วางแผนแล้ว ${tasks.length} งาน${dropped ? ` (ตัดงานที่ไม่ผ่านการตรวจ ${dropped} งาน)` : ''}`,
+    message: `${called.agent.name} วางแผนแล้ว ${tasks.length} งาน${dropped ? ` (ตัดงานที่ไม่ผ่านการตรวจ ${dropped} งาน)` : ''}`,
   }
 }
 
@@ -392,12 +513,17 @@ async function execStep(
 }
 
 // ---------------------------------------------------------------------------
-// ANALYZE: สรุปข้อค้นพบ ตรวจหลักฐาน และ (ถ้าจำเป็น) ขอเครื่องมือเพิ่มอีกหนึ่งรอบ
+// ANALYZE (ทีม): แบ่งผลเครื่องมือเป็นชุดย่อยตามความจุของ agent แต่ละตัว ให้หลายตัวอ่านขนานกัน
+//   → ตรวจหลักฐานโดยระบบ → ผู้ตรวจทานอ่านข้อค้นพบรวม → (ถ้าจำเป็น) ขอเครื่องมือเพิ่มอีกหนึ่งรอบ
+// ทำทีละ "รอบ (wave)" ต่อหนึ่ง step; ความคืบหน้าอยู่ใน config.analysis จึงหยุดแล้วทำต่อได้
 // ---------------------------------------------------------------------------
+const NEEDS_MORE_CAP = 10
+const CONF_RANK: Record<string, number> = { unverified: 0, low: 1, medium: 2, high: 3 }
+
 async function analyzeStep(
   admin: SupabaseClient,
   session: SessionRow,
-  analyst: AnalystAgent,
+  pool: PoolMember[],
   sources: ArtifactRow[]
 ): Promise<StepOutcome> {
   const sid = session.id
@@ -447,7 +573,22 @@ async function analyzeStep(
     return { state: 'blocked', message }
   }
 
-  // artifact ที่ยังไม่ถูกตรวจด้วยเครื่องมือที่รองรับ — ใช้ตัดสินว่าขอรอบเสริมได้หรือไม่
+  // เริ่มรอบสรุปใหม่: ล้างผลเดิมครั้งเดียว (ถ้ารอบนี้ค้างอยู่แล้ว ทำต่อจากที่ค้าง)
+  let state = session.config?.analysis
+  if (!state) {
+    await admin.from('analysis_findings').delete().eq('session_id', sid)
+    state = { done: [], needs_more: [], reviewed: false, wave: 0 }
+    await saveConfig(admin, session, { analysis: state })
+  }
+
+  const doneSet = new Set(state.done)
+  const remaining = outputs.filter((o) => !doneSet.has(o.runId))
+  if (remaining.length > 0) return analyzeWave(admin, session, pool, sources, outputs, remaining, state)
+  return finalizeAnalysis(admin, session, pool, sources, state)
+}
+
+/** ข้อมูลที่ใช้ตัดสินว่ายังมี artifact ที่ไม่ถูกตรวจด้วยเครื่องมือที่รองรับหรือไม่ */
+async function loadCoverage(admin: SupabaseClient, sid: string, sources: ArtifactRow[]) {
   const registry = await getRegistry()
   const tasksPairs = new Set<string>()
   const { data: allTasks } = await admin.from('analysis_tasks').select('input').eq('session_id', sid)
@@ -460,19 +601,10 @@ async function analyzeStep(
       .filter((t) => t.ready && supportsKind(t, a.detected_kind as DetectedKind) && !tasksPairs.has(`${t.id}:${a.id}`))
       .map((t) => ({ artifact_id: a.id, name: a.name, supported_tools: [t.id] }))
   )
+  return { registry, tasksPairs, artifacts, uninspected }
+}
 
-  const called = await callModel(admin, session, analyst, {
-    system: FINDINGS_SYSTEM_PROMPT,
-    user: buildFindingsPrompt(session.goal, outputs, uninspected),
-    maxTokens: 6000,
-  })
-  if (!called.ok) return called.outcome
-
-  const processed = processFindings(called.result.value, outputs)
-
-  // แทนที่ผลสรุปเดิมทั้งหมด (idempotent: step ที่ถูกรันซ้ำหลัง crash จะไม่สร้างข้อค้นพบซ้ำ)
-  await admin.from('analysis_findings').delete().eq('session_id', sid)
-
+async function persistFindings(admin: SupabaseClient, sid: string, processed: ProcessedFindings) {
   const findingRows = processed.findings.map((f) => ({ id: randomUUID(), f }))
   if (findingRows.length > 0) {
     const { error } = await admin.from('analysis_findings').insert(
@@ -500,12 +632,215 @@ async function analyzeStep(
     )
     if (error) throw new Error(`insert limitations: ${error.message}`)
   }
+}
+
+const OUTCOME_RANK: Record<StepOutcome['state'], number> = { blocked: 0, error: 1, waiting: 2, busy: 3, continue: 4, done: 5 }
+
+async function analyzeWave(
+  admin: SupabaseClient,
+  session: SessionRow,
+  pool: PoolMember[],
+  sources: ArtifactRow[],
+  outputs: RunOutput[],
+  remaining: RunOutput[],
+  state: AnalysisState
+): Promise<StepOutcome> {
+  const sid = session.id
+  const first = state.wave === 0
+  // ส่วนคงที่ของ prompt (กติกา + เป้าหมาย + โครง) ใช้คำนวณว่าเหลือที่ให้ข้อมูลเท่าไรในแต่ละตัว
+  const fixedTokens = estimateTokens(FINDINGS_SYSTEM_PROMPT) + estimateTokens(session.goal) + 600
+
+  const shards = planWave(remaining.map((o) => ({ o, len: o.fullText.length })), pool, fixedTokens)
+  if (shards.length === 0) {
+    return {
+      state: 'error',
+      message:
+        `ไม่มี agent ในทีมที่รับข้อมูลผลวิเคราะห์ได้พอ (ตัวที่ใหญ่สุดรับได้ราว ${largestLimit(pool).toLocaleString('en-US')} โทเคนต่อคำขอ) — ` +
+        'เพิ่ม agent ที่ใช้โมเดล context ใหญ่ (เช่น Gemini / Claude) เข้าทีมที่เมนู "ทีม AI"',
+    }
+  }
+
+  const uninspected = first ? (await loadCoverage(admin, sid, sources)).uninspected : []
+
+  const results = await Promise.all(
+    shards.map(async (shard, i) => {
+      const shardRuns = shard.items.map((x) => x.item.o)
+      const maxOut = outputBudgetFor(shard.member.inputLimit)
+      const maxFindings = Math.min(12, Math.max(3, Math.floor(maxOut / 450)))
+      const user = buildFindingsPrompt(session.goal, shardRuns, i === 0 ? uninspected : [], {
+        slices: new Map(shard.items.map((x) => [x.item.o.runId, x.chars])),
+        shardNote:
+          `ข้อมูลนี้เป็นชุดย่อยที่ ${i + 1}/${shards.length} ของรอบนี้ — นักวิเคราะห์ท่านอื่นในทีมอ่านผลเครื่องมือส่วนที่เหลือ ` +
+          'ให้สรุปเฉพาะสิ่งที่เห็นในชุดนี้ และไม่ต้องเขียนข้อจำกัดเรื่องข้อมูลที่ไม่ได้อยู่ในชุดนี้',
+      })
+      const called = await callModel(
+        admin,
+        session,
+        pool,
+        { system: findingsSystemPrompt(maxFindings), user, maxTokens: maxOut },
+        { prefer: 'large', first: shard.member }
+      )
+      return { shardRuns, called }
+    })
+  )
+
+  const ok = results.filter((r): r is typeof r & { called: Extract<ModelCall, { ok: true }> } => r.called.ok)
+  const failed = results.filter((r) => !r.called.ok)
+
+  // บันทึกทีละชุด (ผลของชุดที่สำเร็จไม่หาย แม้ชุดอื่นพลาด — ชุดที่พลาดจะถูกลองใหม่ในรอบถัดไป)
+  const parts: string[] = []
+  let rejected = 0
+  let findingTotal = 0
+  for (const r of ok) {
+    const processed = processFindings(r.called.result.value, r.shardRuns)
+    await persistFindings(admin, sid, processed)
+    state.done.push(...r.shardRuns.map((o) => o.runId))
+    if (Array.isArray(processed.needsMore)) state.needs_more.push(...processed.needsMore.slice(0, 5))
+    rejected += processed.findings.reduce((n, f) => n + f.rejectedEvidence, 0)
+    findingTotal += processed.findings.length
+    parts.push(`${r.called.agent.name} อ่าน ${r.shardRuns.length} ผล`)
+  }
+  state.needs_more = state.needs_more.slice(0, NEEDS_MORE_CAP)
+  if (ok.length > 0) {
+    state.wave += 1
+    await saveConfig(admin, session, { analysis: state })
+  }
+
+  if (ok.length === 0) {
+    const worst = failed
+      .map((r) => (r.called.ok ? null : r.called.outcome))
+      .filter((o): o is StepOutcome => o !== null)
+      .sort((a, b) => OUTCOME_RANK[a.state] - OUTCOME_RANK[b.state])[0]
+    return worst ?? { state: 'error', message: 'สรุปผลไม่สำเร็จ' }
+  }
+
+  const left = remaining.length - ok.reduce((n, r) => n + r.shardRuns.length, 0)
+  return {
+    state: 'continue',
+    message:
+      `ทีมช่วยกันสรุปพร้อมกัน ${ok.length} ชุด (${parts.join(' · ')}) ได้ข้อค้นพบ ${findingTotal} รายการ` +
+      (rejected ? ` (ตัดหลักฐานที่ตรวจไม่ผ่าน ${rejected})` : '') +
+      (left > 0 ? ` — เหลืออีก ${left} ผล` : '') +
+      (failed.length ? ` — ${failed.length} ชุดจะลองใหม่` : ''),
+  }
+}
+
+/** ตัดข้อค้นพบ/ข้อจำกัดที่ชื่อซ้ำกัน (จากหลายชุดย่อย) เก็บตัวที่ความเชื่อมั่นสูงสุด */
+async function dedupeFindings(admin: SupabaseClient, sid: string): Promise<number> {
+  const { data } = await admin
+    .from('analysis_findings')
+    .select('id, kind, title, confidence')
+    .eq('session_id', sid)
+    .order('created_at', { ascending: true })
+  const rows = (data ?? []) as { id: string; kind: string; title: string; confidence: string }[]
+  const best = new Map<string, { id: string; rank: number }>()
+  const drop: string[] = []
+  for (const r of rows) {
+    const key = `${r.kind}:${r.title.trim().toLowerCase().replace(/\s+/g, ' ')}`
+    const rank = CONF_RANK[r.confidence] ?? 0
+    const cur = best.get(key)
+    if (!cur) best.set(key, { id: r.id, rank })
+    else if (rank > cur.rank) {
+      drop.push(cur.id)
+      best.set(key, { id: r.id, rank })
+    } else drop.push(r.id)
+  }
+  if (drop.length > 0) await admin.from('analysis_findings').delete().eq('session_id', sid).in('id', drop)
+  return drop.length
+}
+
+/** ผู้ตรวจทาน: agent ตัวอื่นอ่านข้อค้นพบรวมแล้วชี้ข้อที่เกินหลักฐาน/ซ้ำ — ลด/ตัดได้อย่างเดียว ล้มเหลวแล้วข้ามได้ ไม่ขวางงาน */
+async function reviewFindings(
+  admin: SupabaseClient,
+  session: SessionRow,
+  pool: PoolMember[]
+): Promise<string | null> {
+  const sid = session.id
+  const { data } = await admin
+    .from('analysis_findings')
+    .select('id, title, statement, confidence')
+    .eq('session_id', sid)
+    .eq('kind', 'finding')
+    .order('created_at', { ascending: true })
+    .limit(40)
+  const rows = (data ?? []) as { id: string; title: string; statement: string; confidence: string }[]
+  if (rows.length < 2) return null
+
+  const { data: evData } = await admin
+    .from('analysis_evidence')
+    .select('finding_id, excerpt')
+    .eq('session_id', sid)
+    .in('finding_id', rows.map((r) => r.id))
+  const evBy = new Map<string, string[]>()
+  for (const e of (evData ?? []) as { finding_id: string; excerpt: string }[]) {
+    evBy.set(e.finding_id, [...(evBy.get(e.finding_id) ?? []), e.excerpt])
+  }
+
+  const reviewer = orderPool(pool, 'reviewer')[0]
+  const room = Math.min(reviewer.inputLimit, PER_CALL_TOKEN_CAP) - 2000 - estimateTokens(REVIEW_SYSTEM_PROMPT) - 600
+  const maxChars = Math.min(24_000, room * 3)
+  if (maxChars < 3_000) return null
+
+  const items = rows.map((r) => ({ title: r.title, statement: r.statement, confidence: r.confidence, evidence: evBy.get(r.id) ?? [] }))
+  const { user, included } = buildReviewPrompt(session.goal, items, maxChars)
+  const called = await callModel(
+    admin,
+    session,
+    pool,
+    { system: REVIEW_SYSTEM_PROMPT, user, maxTokens: 2000 },
+    { keepStatus: true, prefer: 'reviewer', first: reviewer }
+  )
+  if (!called.ok) return null
+
+  const v = parseVerdicts(called.result.value, included)
+  const dropIds = new Set<string>()
+  for (const i of v.drops.keys()) dropIds.add(rows[i].id)
+  for (const [, dup] of v.duplicates) dropIds.add(rows[dup].id)
+  const lowerIds = [...v.downgrades.keys()]
+    .filter((i) => !dropIds.has(rows[i].id) && (CONF_RANK[rows[i].confidence] ?? 0) > CONF_RANK.low)
+    .map((i) => rows[i].id)
+
+  if (dropIds.size > 0) await admin.from('analysis_findings').delete().eq('session_id', sid).in('id', [...dropIds])
+  if (lowerIds.length > 0) await admin.from('analysis_findings').update({ confidence: 'low' }).eq('session_id', sid).in('id', lowerIds)
+  const notes = [...v.drops.entries()].slice(0, 5).map(([i, reason]) => ({
+    session_id: sid,
+    kind: 'limitation',
+    title: limitationTitleForDrop(rows[i].title),
+    statement: reason || 'ผู้ตรวจทานเห็นว่าข้อความนี้ไม่ได้รับการรองรับจากหลักฐาน',
+    confidence: 'unverified',
+  }))
+  if (notes.length > 0) await admin.from('analysis_findings').insert(notes)
+
+  return `${called.agent.name} ตรวจทาน: ตัด ${dropIds.size} ลดระดับ ${lowerIds.length}`
+}
+
+async function finalizeAnalysis(
+  admin: SupabaseClient,
+  session: SessionRow,
+  pool: PoolMember[],
+  sources: ArtifactRow[],
+  state: AnalysisState
+): Promise<StepOutcome> {
+  const sid = session.id
+  await dedupeFindings(admin, sid)
+
+  let reviewNote: string | null = null
+  if (!state.reviewed) {
+    try {
+      reviewNote = await reviewFindings(admin, session, pool)
+    } catch (e) {
+      console.error('[analysis] review skipped:', (e as Error).message)
+    }
+    state.reviewed = true
+    await saveConfig(admin, session, { analysis: state })
+  }
 
   // รอบเสริม: อนุญาตเพิ่มงานได้เฉพาะคู่ tool+artifact ที่ยังไม่เคยรัน ภายในเพดานจำนวนงานและจำนวนรอบ
+  const { registry, tasksPairs, artifacts, uninspected } = await loadCoverage(admin, sid, sources)
   const rounds = session.config?.rounds ?? 0
   const roomForTasks = remainingTaskSlots(tasksPairs.size)
-  if (rounds < MAX_EXTRA_ROUNDS && roomForTasks > 0 && uninspected.length > 0) {
-    const extra = parsePlan(processed.needsMore, {
+  if (rounds < MAX_EXTRA_ROUNDS && roomForTasks > 0 && uninspected.length > 0 && state.needs_more.length > 0) {
+    const extra = parsePlan(state.needs_more, {
       artifacts,
       tools: registry.filter((t) => t.ready),
       existingPairs: tasksPairs,
@@ -513,20 +848,21 @@ async function analyzeStep(
     })
     if (extra.tasks.length > 0) {
       await insertTasks(admin, sid, extra.tasks)
-      await admin.from('analysis_sessions')
-        .update({ status: 'running', config: { ...(session.config ?? {}), rounds: rounds + 1, reanalyze: true } })
-        .eq('id', sid)
+      session.config = { ...(session.config ?? {}), rounds: rounds + 1, reanalyze: true, analysis: undefined }
+      await enqueueSessionWrite(admin, session, () => ({ status: 'running', config: session.config }))
       return { state: 'continue', message: `สรุปรอบแรกแล้ว ขอตรวจเพิ่ม ${extra.tasks.length} งาน` }
     }
   }
 
-  await admin.from('analysis_sessions')
-    .update({ status: 'completed', last_error: null, config: { ...(session.config ?? {}), reanalyze: false } })
-    .eq('id', sid)
-  const rejected = processed.findings.reduce((n, f) => n + f.rejectedEvidence, 0)
+  const [{ count: fCount }, { count: lCount }] = await Promise.all([
+    admin.from('analysis_findings').select('id', { count: 'exact', head: true }).eq('session_id', sid).eq('kind', 'finding'),
+    admin.from('analysis_findings').select('id', { count: 'exact', head: true }).eq('session_id', sid).eq('kind', 'limitation'),
+  ])
+  session.config = { ...(session.config ?? {}), reanalyze: false, analysis: undefined }
+  await enqueueSessionWrite(admin, session, () => ({ status: 'completed', last_error: null, config: session.config }))
   return {
     state: 'done',
-    message: `สรุปเสร็จ: ข้อค้นพบ ${processed.findings.length} รายการ ข้อจำกัด ${processed.limitations.length} รายการ${rejected ? ` (ตัดหลักฐานที่ตรวจไม่ผ่าน ${rejected} รายการ)` : ''}`,
+    message: `สรุปเสร็จ: ข้อค้นพบ ${fCount ?? 0} รายการ ข้อจำกัด ${lCount ?? 0} รายการ (ทีม ${pool.length} agent)${reviewNote ? ` · ${reviewNote}` : ''}`,
   }
 }
 

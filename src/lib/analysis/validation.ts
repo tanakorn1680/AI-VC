@@ -54,6 +54,8 @@ export interface UpdateSessionInput {
   goal?: string
   /** agent ที่ใช้วิเคราะห์ (null = ล้างค่า) */
   analyst_agent_id?: string | null
+  /** ทีม AI ที่ใช้วิเคราะห์ (null = เลือกอัตโนมัติ) */
+  analyst_team_id?: string | null
   token_budget?: number
   /** ผู้ใช้เปลี่ยนสถานะได้อย่างเดียวคือยกเลิก */
   cancel?: true
@@ -85,6 +87,13 @@ export function parseUpdateSession(body: unknown): Result<UpdateSessionInput> {
     out.analyst_agent_id = rec.analyst_agent_id
   }
 
+  if (rec.analyst_team_id !== undefined) {
+    if (rec.analyst_team_id !== null && !isValidUUID(rec.analyst_team_id)) {
+      return { ok: false, message: 'รหัสทีมไม่ถูกต้อง' }
+    }
+    out.analyst_team_id = rec.analyst_team_id
+  }
+
   if (rec.token_budget !== undefined) {
     const b = rec.token_budget
     if (typeof b !== 'number' || !Number.isInteger(b) || b < TOKEN_BUDGET_MIN || b > TOKEN_BUDGET_MAX) {
@@ -104,7 +113,7 @@ export function parseUpdateSession(body: unknown): Result<UpdateSessionInput> {
   }
 
   if (
-    out.title === undefined && out.goal === undefined && out.analyst_agent_id === undefined &&
+    out.title === undefined && out.goal === undefined && out.analyst_agent_id === undefined && out.analyst_team_id === undefined &&
     out.token_budget === undefined && !out.cancel
   ) {
     return { ok: false, message: 'ไม่มีข้อมูลที่ต้องแก้ไข' }

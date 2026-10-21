@@ -12,6 +12,11 @@ export interface CompletionRequest {
   maxTokens: number
   /** ใช้เฉพาะ provider แบบ custom (OpenAI-compatible) */
   baseUrl?: string
+  /**
+   * เพดานของ max_tokens ที่ส่งให้ provider จริง (หลังบวก headroom ของรุ่นที่คิดก่อนตอบแล้ว)
+   * ใช้กับ provider ที่นับ max_tokens รวมในเพดานคำขอ (เช่น Groq แพ็กเกจฟรี 8,000) — ไม่ระบุ = ไม่จำกัดเพิ่ม
+   */
+  outputCap?: number
 }
 
 export interface CompletionResult {

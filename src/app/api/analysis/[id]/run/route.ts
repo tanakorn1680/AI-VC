@@ -7,7 +7,7 @@ type Ctx = { params: Promise<{ id: string }> }
 
 // วิเคราะห์ต่อ "หนึ่ง step" (วางแผน / รันเครื่องมือหนึ่งงาน / สรุปผล) แล้วคืนสถานะให้ผู้เรียกเรียกซ้ำ
 // สถานะอยู่ใน DB ทั้งหมด จึงปิดหน้าแล้วกลับมาทำต่อได้
-export const maxDuration = 60
+export const maxDuration = 120
 
 export async function POST(_req: Request, { params }: Ctx) {
   const auth = await requireUser()
