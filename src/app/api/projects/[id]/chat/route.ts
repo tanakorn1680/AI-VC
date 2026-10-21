@@ -1,3 +1,4 @@
+import { after } from 'next/server'
 import { requireUser } from '@/lib/supabase/auth'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { apiOk, apiError, parseBody } from '@/lib/utils/api'
@@ -7,14 +8,18 @@ import { completeWithRetry } from '@/lib/ai/retry'
 import { InvalidApiKeyError, InsufficientCreditError, RateLimitError } from '@/lib/ai/types'
 import { resolveAgentKey } from '@/lib/ai/agent-key'
 import { loadTeam, pickLead, runLeadTurn } from '@/lib/orchestrator/lead'
+import { refreshMemoryWithTeamLead } from '@/lib/orchestrator/memory-run'
+import { acquireTeam, resolveProjectTeam } from '@/lib/team/team'
 
 export const maxDuration = 120
 
-const MIGRATION_HINT = 'ฐานข้อมูลยังไม่รองรับแผนงานในแชท — เปิด Supabase > SQL Editor แล้วรันไฟล์ supabase/migrations/0004_simple_agents.sql หนึ่งครั้ง'
+const MIGRATION_HINT = 'ฐานข้อมูลยังไม่รองรับแผนงานในแชท/ทีมกลาง — เปิด Supabase > SQL Editor แล้วรันไฟล์ supabase/migrations/0004_simple_agents.sql และ 0010_shared_teams.sql (ถ้ายังไม่เคยรัน)'
 
 /**
  * คุยกับหัวหน้าทีม — ทุกข้อความเป็นบทสนทนาปกติ ไม่ใช่การสั่งงานทันที
  * หัวหน้าทีมตอบเอง / ถามกลับ / เสนอแผนให้กดยืนยัน (งานจะเริ่มเมื่อผู้ใช้ยืนยันเท่านั้น)
+ * ทีม AI เป็นของผู้ใช้ ใช้ร่วมกันทุกโปรเจกต์ แต่ประจำได้ทีละ 1 โปรเจกต์ — ส่งข้อความที่นี่จะให้ทีมเข้าประจำโปรเจกต์นี้ (ถ้าทีมยังมีงานค้างที่อื่นจะตอบ 409)
+ * ความจำ: ประวัติแชทเก่าถูกสรุปเป็น brief อัตโนมัติเมื่อยาวเกินงบ (ทำหลังตอบ ไม่ทำให้รอ)
  * ผลลัพธ์อยู่ในตาราง messages (หน้าจอ poll อยู่แล้ว) endpoint นี้ตอบแค่ว่าสำเร็จหรือไม่
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -31,20 +36,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
   const { data: projectRow } = await auth.supabase
     .from('projects')
-    .select('id, name, instructions, max_tasks_per_run, budget_usd, spent_usd')
+    .select('id, name, instructions, max_tasks_per_run, budget_usd, spent_usd, team_id')
     .eq('id', id)
     .maybeSingle()
   const project = projectRow as {
     id: string; name: string; instructions: string | null; max_tasks_per_run: number
-    budget_usd: number | null; spent_usd: number
+    budget_usd: number | null; spent_usd: number; team_id: string | null
   } | null
   if (!project) return apiError('NOT_FOUND', 'ไม่พบโปรเจกต์นี้')
   if (project.budget_usd !== null && Number(project.spent_usd) >= Number(project.budget_usd)) {
     return apiError('BUDGET_EXCEEDED', 'ใช้งบของโปรเจกต์นี้ครบแล้ว — เพิ่มงบก่อนจึงจะคุยต่อได้')
   }
 
-  const team = await loadTeam(auth.supabase, id).catch(() => null)
-  if (!team) return apiError('INTERNAL_ERROR', 'โหลดทีม AI ไม่สำเร็จ')
+  let teamId: string
+  let team: Awaited<ReturnType<typeof loadTeam>>
+  try {
+    const resolved = await resolveProjectTeam(auth.supabase, auth.user.id, project)
+    teamId = resolved.team.id
+    team = await loadTeam(auth.supabase, teamId)
+  } catch (e) {
+    return apiError('INTERNAL_ERROR', e instanceof Error ? e.message : 'โหลดทีม AI ไม่สำเร็จ')
+  }
   const lead = pickLead(team)
   if (!lead) return apiError('BAD_REQUEST', 'ยังไม่มี AI ในทีม — ไปที่แท็บ Agents แล้วเพิ่ม (แค่วาง API key แล้วเลือกโมเดล)')
 
@@ -52,6 +64,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   const admin = createAdminClient()
   const apiKey = await resolveAgentKey(admin, lead, auth.user.id)
   if (!apiKey) return apiError('BAD_REQUEST', `${lead.name} ยังไม่มี API key — เพิ่มที่แท็บ Agents`)
+
+  // กติกา 1 โปรเจกต์ต่อทีม: ให้ทีมเข้าประจำโปรเจกต์นี้ก่อนเริ่มคุย (ทีมที่ยังมีงานค้างที่อื่นจะถูกปฏิเสธ)
+  const acquired = await acquireTeam(admin, teamId, id)
+  if (!acquired.ok) return apiError(acquired.reason === 'error' ? 'INTERNAL_ERROR' : 'CONFLICT', acquired.message)
 
   const { data: saved, error: saveError } = await auth.supabase
     .from('messages')
@@ -72,11 +88,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         instructions: project.instructions ?? '',
         max_tasks_per_run: project.max_tasks_per_run,
       },
+      teamId,
       team,
       lead,
       apiKey,
       userMessage: message,
       userMessageId,
+    })
+
+    // รีเฟรชความจำหลังตอบเสร็จ: โปรเจกต์เดิมที่ทีมเพิ่งย้ายมา (สรุปทันที) แล้วโปรเจกต์นี้ (สรุปเมื่อแชทเกินงบ)
+    after(async () => {
+      try {
+        if (acquired.previousProjectId) {
+          await refreshMemoryWithTeamLead(admin, { projectId: acquired.previousProjectId, teamId, ownerId: auth.user.id, force: true })
+        }
+        await refreshMemoryWithTeamLead(admin, { projectId: id, teamId, ownerId: auth.user.id })
+      } catch (e) {
+        console.error('[chat] รีเฟรชความจำไม่สำเร็จ:', e instanceof Error ? e.message : e)
+      }
     })
     return apiOk({ ok: true })
   } catch (e) {
@@ -92,6 +121,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return apiError('RATE_LIMITED', 'ผู้ให้บริการจำกัดความถี่การใช้งาน รอสักครู่แล้วลองใหม่')
     }
     const msg = e instanceof Error ? e.message : 'คุยไม่สำเร็จ'
-    return apiError('INTERNAL_ERROR', /column|plan_status|\bplan\b/i.test(msg) ? MIGRATION_HINT : msg)
+    return apiError('INTERNAL_ERROR', /column|plan_status|\bplan\b|team|relation/i.test(msg) ? MIGRATION_HINT : msg)
   }
 }

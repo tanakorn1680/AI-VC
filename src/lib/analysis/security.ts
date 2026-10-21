@@ -18,7 +18,7 @@ export type AnalystResult =
 
 /**
  * ตรวจและโหลด agent ที่ใช้เป็นนักวิเคราะห์ (ใช้ service role)
- * agent ต้องอยู่ใน project ที่เป็นของเจ้าของงานวิเคราะห์เท่านั้น — กันการชี้ agent/key ของคนอื่นผ่าน UUID
+ * agent ต้องอยู่ในทีมที่เป็นของเจ้าของงานวิเคราะห์เท่านั้น — กันการชี้ agent/key ของคนอื่นผ่าน UUID
  * key ใช้เรียก provider อย่างเดียว ไม่ส่งต่อไปยังเครื่องมือวิเคราะห์หรือเขียนลง DB/log ใด ๆ
  */
 export async function loadAnalyst(
@@ -30,21 +30,21 @@ export async function loadAnalyst(
 
   const { data: agent } = await admin
     .from('agents')
-    .select('id, name, provider, model, base_url, max_tokens, project_id')
+    .select('id, name, provider, model, base_url, max_tokens, team_id')
     .eq('id', agentId)
     .maybeSingle()
   if (!agent) return { ok: false, message: 'ไม่พบ agent ที่เลือกไว้ (อาจถูกลบแล้ว) กรุณาเลือกใหม่' }
   const a = agent as {
     id: string; name: string; provider: string; model: string
-    base_url: string | null; max_tokens: number | null; project_id: string
+    base_url: string | null; max_tokens: number | null; team_id: string
   }
 
-  const { data: project } = await admin
-    .from('projects')
+  const { data: team } = await admin
+    .from('teams')
     .select('owner_id')
-    .eq('id', a.project_id)
+    .eq('id', a.team_id)
     .maybeSingle()
-  if (!project || (project as { owner_id: string }).owner_id !== sessionOwnerId) {
+  if (!team || (team as { owner_id: string }).owner_id !== sessionOwnerId) {
     return { ok: false, message: 'ไม่พบ agent ที่เลือกไว้ กรุณาเลือกใหม่' }
   }
 

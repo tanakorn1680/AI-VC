@@ -1,99 +1,12 @@
-import { requireUser } from '@/lib/supabase/auth'
-import { createAdminClient } from '@/lib/supabase/admin'
-import { apiOk, apiError, parseBody } from '@/lib/utils/api'
-import { isValidUUID, sanitizeShort } from '@/lib/utils/sanitize'
-
-type Ctx = { params: Promise<{ id: string; agentId: string }> }
-
-/** ลบ AI ออกจากทีม — key ใน Vault ถูกลบตามอัตโนมัติ (trigger ใน 0004) ถ้าลบหัวหน้าทีม ตัวที่อยู่มานานสุดจะรับตำแหน่งต่อ */
-export async function DELETE(_req: Request, { params }: Ctx) {
-  const { id, agentId } = await params
-  if (!isValidUUID(id) || !isValidUUID(agentId)) return apiError('BAD_REQUEST', 'id ไม่ถูกต้อง')
-
-  const auth = await requireUser()
-  if (!auth) return apiError('UNAUTHORIZED', 'ต้องล็อกอินก่อน')
-
-  // RLS: ลบได้เฉพาะ agent ใน project ของตัวเอง — task ที่ผูกอยู่จะถูก set null (ดู schema)
-  const { error } = await auth.supabase.from('agents').delete().eq('id', agentId).eq('project_id', id)
-  if (error) return apiError('FORBIDDEN', 'ลบไม่ได้: ' + error.message)
-
-  const { data: rest } = await auth.supabase
-    .from('agents')
-    .select('id, role')
-    .eq('project_id', id)
-    .order('created_at', { ascending: true })
-  const left = (rest ?? []) as Array<{ id: string; role: string }>
-  if (left.length > 0 && !left.some((a) => a.role === 'manager')) {
-    await auth.supabase.from('agents').update({ role: 'manager' }).eq('id', left[0]!.id).eq('project_id', id)
-  }
-  return apiOk({ ok: true })
-}
+import { apiError } from '@/lib/utils/api'
 
 /**
- * แก้ AI ตัวหนึ่ง — ส่งเฉพาะช่องที่ต้องการเปลี่ยน
- * { name?, duty?, model?, api_key? (เปลี่ยน key), make_lead? (ตั้งเป็นหัวหน้าทีม), can_write_files? }
+ * เลิกใช้แล้ว — AI เป็นของ "ทีม" ใช้ร่วมกันทุกโปรเจกต์ ใช้ /api/teams/:teamId/agents แทน
+ * (หน้าโปรเจกต์ดูทีมของโปรเจกต์ได้ที่ GET /api/projects/:id/team)
+ * คงไฟล์ไว้เป็น stub เพื่อให้การแตกไฟล์ทับ repo เดิมไม่ทิ้งโค้ดเก่าที่ยังผูก agent กับโปรเจกต์
  */
-export async function PATCH(req: Request, { params }: Ctx) {
-  const { id, agentId } = await params
-  if (!isValidUUID(id) || !isValidUUID(agentId)) return apiError('BAD_REQUEST', 'id ไม่ถูกต้อง')
+const gone = () => apiError('BAD_REQUEST', 'เส้นทางนี้เลิกใช้แล้ว — AI เป็นของทีม ใช้ /api/teams/:teamId/agents แทน')
 
-  const auth = await requireUser()
-  if (!auth) return apiError('UNAUTHORIZED', 'ต้องล็อกอินก่อน')
-
-  const [body, err] = await parseBody<{
-    name?: unknown; duty?: unknown; model?: unknown; api_key?: unknown; make_lead?: unknown; can_write_files?: unknown
-  }>(req)
-  if (err) return err
-
-  // ยืนยันว่า agent นี้อยู่ใน project ของผู้ใช้ (ผ่าน RLS) ก่อนทำอะไรต่อ
-  const { data: found } = await auth.supabase.from('agents').select('id').eq('id', agentId).eq('project_id', id).maybeSingle()
-  if (!found) return apiError('NOT_FOUND', 'ไม่พบ AI ตัวนี้')
-
-  const update: Record<string, unknown> = {}
-  if (body.name !== undefined) {
-    const name = sanitizeShort(body.name, 100)
-    if (!name) return apiError('BAD_REQUEST', 'ชื่อต้องไม่ว่าง')
-    update.name = name
-  }
-  if (body.duty !== undefined) update.duty = sanitizeShort(body.duty, 300)
-  if (body.model !== undefined) {
-    const model = sanitizeShort(body.model, 100)
-    if (!model) return apiError('BAD_REQUEST', 'โมเดลต้องไม่ว่าง')
-    update.model = model
-  }
-  if (body.can_write_files !== undefined) {
-    if (typeof body.can_write_files !== 'boolean') return apiError('BAD_REQUEST', 'can_write_files ต้องเป็น true หรือ false')
-    update.allowed_tools = body.can_write_files ? ['read_file', 'write_file'] : ['read_file']
-  }
-
-  let newKey: string | null = null
-  if (body.api_key !== undefined) {
-    newKey = typeof body.api_key === 'string' ? body.api_key.trim() : ''
-    if (newKey.length < 8 || newKey.length > 500) return apiError('BAD_REQUEST', 'API key ความยาวไม่สมเหตุสมผล')
-  }
-  if (Object.keys(update).length === 0 && newKey === null && body.make_lead !== true) {
-    return apiError('BAD_REQUEST', 'ไม่มีอะไรให้แก้')
-  }
-
-  if (Object.keys(update).length > 0) {
-    const { error } = await auth.supabase.from('agents').update(update).eq('id', agentId).eq('project_id', id)
-    if (error) {
-      if (error.code === '23505') return apiError('BAD_REQUEST', 'มี AI ชื่อนี้ในทีมแล้ว ตั้งชื่ออื่น')
-      return apiError('FORBIDDEN', 'แก้ไม่ได้: ' + error.message)
-    }
-  }
-
-  if (body.make_lead === true) {
-    // หัวหน้าทีมมีได้คนเดียว: ปลดคนเดิมก่อน แล้วตั้งคนใหม่
-    await auth.supabase.from('agents').update({ role: 'custom' }).eq('project_id', id).eq('role', 'manager')
-    const { error } = await auth.supabase.from('agents').update({ role: 'manager' }).eq('id', agentId).eq('project_id', id)
-    if (error) return apiError('FORBIDDEN', 'ตั้งหัวหน้าทีมไม่ได้: ' + error.message)
-  }
-
-  if (newKey !== null) {
-    const { error } = await createAdminClient().rpc('set_agent_key', { p_agent_id: agentId, p_key: newKey })
-    if (error) return apiError('INTERNAL_ERROR', `เก็บ API key ไม่สำเร็จ: ${error.message}`)
-  }
-
-  return apiOk({ ok: true })
-}
+export const GET = gone
+export const PATCH = gone
+export const DELETE = gone

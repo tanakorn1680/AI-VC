@@ -4,13 +4,15 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import AgentsPanel, { type Agent } from './agents-panel'
+import MemoryPanel from './memory-panel'
+import TeamBanner, { type TeamInfo } from './team-banner'
 import FilesPanel from './files-panel'
 import UsagePanel from './usage-panel'
 import ChatView, { type Message } from './chat-view'
 import NavDrawer, { type NavItem } from './nav-drawer'
-import { AgentsIcon, ChatIcon, FilesIcon, MenuIcon, TasksIcon, UsageIcon } from './icons'
+import { AgentsIcon, ChatIcon, FilesIcon, MemoryIcon, MenuIcon, TasksIcon, UsageIcon } from './icons'
 
-type Tab = 'chat' | 'agents' | 'tasks' | 'files' | 'usage'
+type Tab = 'chat' | 'agents' | 'tasks' | 'files' | 'memory' | 'usage'
 
 interface TaskRow {
   id: string
@@ -36,6 +38,7 @@ const TAB_LABEL: Record<Tab, string> = {
   agents: 'Agents',
   tasks: 'Tasks',
   files: 'ไฟล์',
+  memory: 'ความจำ',
   usage: 'การใช้งาน',
 }
 
@@ -67,6 +70,7 @@ export default function WorkspaceClient({
   const [messages, setMessages] = useState<Message[]>([])
   const [tasks, setTasks] = useState<TaskRow[]>([])
   const [agents, setAgents] = useState<Agent[]>([])
+  const [teamInfo, setTeamInfo] = useState<TeamInfo | null>(null)
   const [agentsLoaded, setAgentsLoaded] = useState(false)
   const [draft, setDraft] = useState('') // เก็บไว้ที่นี่ เพื่อไม่หายเวลาสลับแท็บ
 
@@ -75,7 +79,7 @@ export default function WorkspaceClient({
       const [msgRes, taskRes, agentRes] = await Promise.all([
         fetch(`/api/projects/${projectId}/messages`),
         fetch(`/api/projects/${projectId}/tasks`),
-        fetch(`/api/projects/${projectId}/agents`),
+        fetch(`/api/projects/${projectId}/team`),
       ])
       // อัปเดต state เฉพาะเมื่อข้อมูลเปลี่ยนจริง เพื่อไม่ให้หน้า render ซ้ำทุก 3 วินาที
       if (msgRes.ok) {
@@ -87,8 +91,12 @@ export default function WorkspaceClient({
         setTasks((prev) => (sameJson(prev, next) ? prev : next))
       }
       if (agentRes.ok) {
-        const next: Agent[] = (await agentRes.json()).agents ?? []
+        // ทีมกลาง: AI เป็นของทีม (ใช้ร่วมกันทุกโปรเจกต์) — endpoint นี้คืนทีมของโปรเจกต์ + AI + สถานะล็อก 1 โปรเจกต์ต่อทีม
+        const data = (await agentRes.json()) as TeamInfo & { agents?: Agent[] }
+        const next: Agent[] = data.agents ?? []
         setAgents((prev) => (sameJson(prev, next) ? prev : next))
+        const info: TeamInfo = { team: data.team, teams: data.teams, lock: data.lock, held_by_other: data.held_by_other }
+        setTeamInfo((prev) => (sameJson(prev, info) ? prev : info))
         setAgentsLoaded(true)
       }
     } catch {
@@ -139,10 +147,13 @@ export default function WorkspaceClient({
       { id: 'agents', label: TAB_LABEL.agents, icon: <AgentsIcon /> },
       { id: 'tasks', label: TAB_LABEL.tasks, icon: <TasksIcon />, badge: activeCount || undefined },
       { id: 'files', label: TAB_LABEL.files, icon: <FilesIcon /> },
+      { id: 'memory', label: TAB_LABEL.memory, icon: <MemoryIcon /> },
       { id: 'usage', label: TAB_LABEL.usage, icon: <UsageIcon /> },
     ],
     [activeCount],
   )
+
+  const lock = teamInfo?.lock ?? null
 
   const closeMenu = useCallback(() => setMenuOpen(false), [])
 
@@ -177,7 +188,10 @@ export default function WorkspaceClient({
         <div className="mx-auto flex h-14 w-full max-w-3xl items-center gap-3 px-4">
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-[15px] font-semibold leading-5">{projectName}</h1>
-            <p className="truncate text-xs leading-4 text-neutral-500">{TAB_LABEL[tab]}</p>
+            <p className="truncate text-xs leading-4 text-neutral-500">
+              {TAB_LABEL[tab]}
+              {teamInfo ? ` · ทีม ${teamInfo.team.name}` : ''}
+            </p>
           </div>
           <button
             type="button"
@@ -193,6 +207,17 @@ export default function WorkspaceClient({
           </button>
         </div>
       </header>
+
+      {tab === 'chat' && teamInfo && lock?.state === 'elsewhere' && (
+        <div className="shrink-0 border-b border-amber-900/50 bg-amber-950/30 px-4 py-2 text-xs leading-relaxed text-amber-200">
+          <div className="mx-auto w-full max-w-3xl">
+            ทีม &quot;{teamInfo.team.name}&quot; ประจำโปรเจกต์ &quot;{lock.project_name}&quot; อยู่
+            {lock.busy
+              ? ' และยังมีงานค้าง — ส่งข้อความที่นี่ไม่ได้จนกว่างานนั้นจะเสร็จ (หรือเลือกทีมอื่นที่แท็บ Agents)'
+              : ' — ส่งข้อความเพื่อย้ายทีมมาทำโปรเจกต์นี้'}
+          </div>
+        </div>
+      )}
 
       {tab === 'chat' ? (
         <ChatView
@@ -213,7 +238,13 @@ export default function WorkspaceClient({
             className="mx-auto w-full max-w-3xl p-4"
             style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom))' }}
           >
-            {tab === 'agents' && <AgentsPanel projectId={projectId} agents={agents} onChanged={refresh} />}
+            {tab === 'agents' && teamInfo && (
+              <div className="space-y-4">
+                <TeamBanner projectId={projectId} info={teamInfo} onChanged={refresh} />
+                <AgentsPanel apiBase={`/api/teams/${teamInfo.team.id}`} agents={agents} onChanged={refresh} />
+              </div>
+            )}
+            {tab === 'agents' && !teamInfo && <p className="text-sm text-neutral-500">กำลังโหลดทีม...</p>}
 
             {tab === 'tasks' && (
               <div className="space-y-2">
@@ -257,6 +288,8 @@ export default function WorkspaceClient({
             )}
 
             {tab === 'files' && <FilesPanel projectId={projectId} />}
+
+            {tab === 'memory' && <MemoryPanel projectId={projectId} />}
 
             {tab === 'usage' && <UsagePanel projectId={projectId} />}
           </div>

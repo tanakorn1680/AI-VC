@@ -100,3 +100,11 @@ export function Spinner({ size = 16 }: IconProps) {
     </svg>
   )
 }
+
+export const MemoryIcon = ({ size }: IconProps) => (
+  <Svg size={size}>
+    <path d="M12 3a9 9 0 1 0 9 9" />
+    <path d="M12 7v5l3 2" />
+    <path d="M17 3h4v4" />
+  </Svg>
+)

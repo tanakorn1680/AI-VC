@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, type ReactNode, type TouchEvent } from 'react'
 import Link from 'next/link'
-import { CloseIcon, FolderIcon, LogoutIcon } from './icons'
+import { AgentsIcon, CloseIcon, FolderIcon, LogoutIcon } from './icons'
 
 export interface NavItem {
   id: string
@@ -131,6 +131,13 @@ export default function NavDrawer({
           >
             <FolderIcon />
             <span>โปรเจกต์ทั้งหมด</span>
+          </Link>
+          <Link
+            href="/team"
+            className="flex min-h-12 items-center gap-3 rounded-lg px-3 text-[15px] text-neutral-400 active:bg-neutral-900 hover:bg-neutral-900 hover:text-neutral-200"
+          >
+            <AgentsIcon />
+            <span>ทีม AI ทั้งหมด</span>
           </Link>
           <button
             type="button"

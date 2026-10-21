@@ -43,7 +43,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const { data: agentRows } = await auth.supabase
     .from('agents')
     .select('id, name, provider, model')
-    .eq('project_id', id)
   const agents = (agentRows ?? []) as Array<{ id: string; name: string; provider: string; model: string }>
   const agentById = new Map(agents.map((a) => [a.id, a]))
 

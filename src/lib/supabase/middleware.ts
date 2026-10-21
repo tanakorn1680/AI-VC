@@ -33,6 +33,7 @@ export async function updateSession(request: NextRequest) {
   const isAuthRoute = pathname.startsWith('/login') || pathname.startsWith('/signup')
   const isAppRoute =
     pathname.startsWith('/projects') ||
+    pathname.startsWith('/team') ||
     pathname.startsWith('/reverse-engineering') ||
     pathname.startsWith('/settings')
 

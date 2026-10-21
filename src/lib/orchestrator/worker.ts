@@ -5,10 +5,14 @@ import { extractFiles } from '../files/extract'
 import { saveFileVersion } from '../files/save'
 import { InvalidApiKeyError, InsufficientCreditError, RateLimitError } from '../ai/types'
 import { resolveAgentKey } from '../ai/agent-key'
-import { composeWorkerPrompt } from './lead-plan'
+import { composeWorkerPrompt, splitSummary } from './lead-plan'
+import { clip } from './context-budget'
 import { buildTaskContext } from './context-builder'
 import { calculateCost } from './pricing'
 import { enqueueTask } from './queue'
+
+/** ทีมของ agent ไม่ได้ประจำโปรเจกต์นี้ (กติกา 1 โปรเจกต์ต่อทีม) — รอเฉย ๆ ไม่มีวันสำเร็จ จึงไม่ retry อัตโนมัติ */
+class TeamNotAssignedError extends Error {}
 
 interface TaskRow {
   id: string
@@ -51,13 +55,25 @@ export async function processTask(admin: SupabaseClient, taskId: string): Promis
       throw new Error('Task นี้ไม่มี agent ผูกอยู่ — ผู้ใช้ต้องเลือก agent ก่อน')
     }
 
-    interface AgentRow { id: string; name: string; duty?: string | null; provider: string; model: string; system_prompt: string; max_tokens: number | null; base_url: string | null; allowed_tools: string[] | null }
-    // duty มาจาก migration 0004 — ถ้ายังไม่ได้รัน ให้ทำงานต่อได้ด้วยคอลัมน์เดิม
-    const agentCols = 'id, name, provider, model, system_prompt, max_tokens, base_url, allowed_tools'
-    let agentRes = await admin.from('agents').select(`${agentCols}, duty`).eq('id', task.assigned_agent).single()
-    if (agentRes.error) agentRes = await admin.from('agents').select(agentCols).eq('id', task.assigned_agent).single()
+    interface AgentRow { id: string; name: string; role: string; team_id: string; duty?: string | null; provider: string; model: string; system_prompt: string; max_tokens: number | null; base_url: string | null; allowed_tools: string[] | null }
+    const agentRes = await admin
+      .from('agents')
+      .select('id, name, role, team_id, duty, provider, model, system_prompt, max_tokens, base_url, allowed_tools')
+      .eq('id', task.assigned_agent)
+      .single()
     const agent = agentRes.data as unknown as AgentRow | null
     if (agentRes.error || !agent) throw new Error('หา agent ที่ผูกกับ task นี้ไม่เจอ')
+
+    // กติกา 1 โปรเจกต์ต่อทีม: ทำงานได้เฉพาะเมื่อทีมของ agent ประจำโปรเจกต์นี้อยู่ (acquire_team ตอนคุย/เริ่มแผน/retry)
+    const { data: holder } = await admin
+      .from('teams')
+      .select('id')
+      .eq('id', agent.team_id)
+      .eq('active_project_id', task.project_id)
+      .maybeSingle()
+    if (!holder) {
+      throw new TeamNotAssignedError('ทีมของ AI ตัวนี้ไม่ได้ประจำโปรเจกต์นี้ (กำลังทำโปรเจกต์อื่น) — กด "ลองใหม่" ที่แท็บ Tasks เมื่อทีมว่าง')
+    }
 
     interface ProjectRow { owner_id: string; max_tokens_per_task: number }
     const { data: project, error: projectError } = await admin
@@ -79,7 +95,8 @@ export async function processTask(admin: SupabaseClient, taskId: string): Promis
     // อ่านเนื้อหาไฟล์เฉพาะที่แผนระบุว่างานนี้ต้องใช้ (คุม token) ส่วนที่เหลือเห็นแค่ชื่อ
     const rawFiles = task.input?.files
     const wantedFiles = Array.isArray(rawFiles) ? rawFiles.filter((f): f is string => typeof f === 'string') : []
-    const contextPrompt = await buildTaskContext(admin, task, { includeFiles: canReadFiles, files: wantedFiles })
+    const isReviewer = agent.role === 'reviewer'
+    const contextPrompt = await buildTaskContext(admin, task, { includeFiles: canReadFiles, files: wantedFiles, reviewer: isReviewer })
     const adapter = getAdapter(agent.provider)
 
     const result = await completeWithRetry(adapter, {
@@ -90,21 +107,23 @@ export async function processTask(admin: SupabaseClient, taskId: string): Promis
         duty: agent.duty ?? '',
         systemPrompt: agent.system_prompt,
         canWriteFiles,
+        isReviewer,
       }),
       userPrompt: contextPrompt,
       maxTokens: agent.max_tokens ?? project?.max_tokens_per_task ?? 4096,
       baseUrl: agent.base_url ?? undefined,
     })
 
-    // summary สั้น ๆ สำหรับส่งต่อ Task ถัดไป (ประหยัด token ตามหลัก Context Management)
-    // MVP: ตัดความยาวแบบตรงไปตรงมา — ยังไม่เรียก AI ซ้ำเพื่อสรุป (เพิ่มทีหลังถ้าจำเป็นจริง)
+    // summary สำหรับส่งต่อ Task ถัดไป: ใช้บล็อก <summary> ที่ agent เขียนเอง (ครบประเด็นกว่าการตัดข้อความดิบ)
+    // ถ้าโมเดลไม่ตามรูปแบบ → fallback ตัดข้อความ 800 ตัวอักษร
     // ไฟล์ที่ agent ส่งมา (<file path="...">) แยกออกจากข้อความ — summary/แชทใช้ข้อความที่แทนบล็อกไฟล์ด้วย [ไฟล์ path]
     // เพื่อไม่ให้โค้ดทั้งก้อนไหลไปกิน token ของ task ถัดไป (task ถัดไปอ่านตัวไฟล์ได้จาก read_file)
+    const { body: bodyText, summary: tagged } = splitSummary(result.text)
     const extracted = canWriteFiles
-      ? extractFiles(result.text)
-      : { files: [], text: result.text, skipped: [] as string[] }
+      ? extractFiles(bodyText)
+      : { files: [], text: bodyText, skipped: [] as string[] }
     const shownText = extracted.text
-    const summary = shownText.length > 800 ? shownText.slice(0, 800) + '…' : shownText
+    const summary = tagged ? clip(tagged, 600) : clip(shownText, 800)
 
     const cost = await calculateCost(admin, agent.provider, agent.model, result.tokensIn, result.tokensOut)
 
@@ -161,7 +180,7 @@ async function handleTaskFailure(admin: SupabaseClient, task: TaskRow, err: unkn
   console.error(`[worker] task ${task.id} ล้มเหลว:`, message)
 
   // key ผิด หรือเครดิตหมด: retry ไม่มีทางสำเร็จ ปิดเป็น failed ทันทีโดยไม่กินโควตา attempts เพิ่ม
-  if (err instanceof InvalidApiKeyError || err instanceof InsufficientCreditError) {
+  if (err instanceof InvalidApiKeyError || err instanceof InsufficientCreditError || err instanceof TeamNotAssignedError) {
     await admin
       .from<TaskRow>('tasks')
       .update({ status: 'failed', error: message, completed_at: new Date().toISOString() })

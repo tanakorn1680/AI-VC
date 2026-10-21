@@ -1,7 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { CompletionRequest, CompletionResult } from '../ai/types'
-import { calculateCost } from './pricing'
 import { enqueueReadyTasks } from './worker'
+import { BUDGET } from './context-budget'
+import { fitRecent, loadMemory, loadUnsummarized } from './memory'
+import { recordChatUsage } from './usage'
 import {
   buildLeadSystemPrompt,
   buildLeadUserPrompt,
@@ -14,8 +16,8 @@ import {
 
 /** เพดาน token ของคำตอบหัวหน้าทีมต่อครั้ง (agent ตั้ง max_tokens เองได้) — แชทปกติสั้นอยู่แล้ว แผนต้องการที่มากกว่าเล็กน้อย */
 export const LEAD_MAX_TOKENS = 2000
-/** จำนวนข้อความล่าสุดที่ส่งให้หัวหน้าทีมเป็นบริบท — ไม่ส่งทั้งประวัติ (คุม token ไม่ให้โตตามความยาวแชท) */
-const HISTORY_MESSAGES = 14
+/** ดึงข้อความที่ยังไม่ถูกสรุปมาไม่เกินนี้ แล้วค่อยตัดให้พอดีงบ token (BUDGET.leadHistoryTokens) */
+const HISTORY_FETCH = 60
 const FILES_LISTED = 40
 const TASKS_FOR_STATUS = 20
 
@@ -27,17 +29,15 @@ export interface TeamAgent extends TeamMember {
 // ---------------------------------------------------------------------------
 // ทีม
 // ---------------------------------------------------------------------------
-type AgentRow = Omit<TeamAgent, 'duty'> & { duty?: string | null }
-
-/** โหลด agent ของ project (เรียงตามเวลาที่เพิ่ม) — ทนต่อฐานข้อมูลที่ยังไม่ได้รัน migration 0004 (ยังไม่มีคอลัมน์ duty) */
-export async function loadTeam(client: SupabaseClient, projectId: string): Promise<TeamAgent[]> {
-  const base = 'id, name, role, provider, model, base_url, max_tokens'
-  let res = await client.from('agents').select(`${base}, duty`).eq('project_id', projectId).order('created_at', { ascending: true })
-  if (res.error) {
-    res = await client.from('agents').select(base).eq('project_id', projectId).order('created_at', { ascending: true })
-  }
-  if (res.error) throw new Error(res.error.message)
-  return ((res.data ?? []) as unknown as AgentRow[]).map((r) => ({ ...r, duty: r.duty ?? '' }))
+/** โหลด agent ของทีม (เรียงตามเวลาที่เพิ่ม) — agent เป็นของทีม ใช้ร่วมกันทุกโปรเจกต์ */
+export async function loadTeam(client: SupabaseClient, teamId: string): Promise<TeamAgent[]> {
+  const { data, error } = await client
+    .from('agents')
+    .select('id, name, role, provider, model, base_url, max_tokens, duty')
+    .eq('team_id', teamId)
+    .order('created_at', { ascending: true })
+  if (error) throw new Error(error.message)
+  return ((data ?? []) as unknown as Array<Omit<TeamAgent, 'duty'> & { duty?: string | null }>).map((r) => ({ ...r, duty: r.duty ?? '' }))
 }
 
 /** หัวหน้าทีม = agent ที่ role เป็น manager ตัวแรก ถ้าไม่มีใช้ตัวที่เพิ่มก่อนสุด */
@@ -69,7 +69,8 @@ export function topoOrder(tasks: Array<{ depends_on: number[] }>): number[] {
   return order
 }
 
-export async function startPlan(admin: SupabaseClient, projectId: string, messageId: string): Promise<StartResult> {
+/** teamId = ทีมที่ประจำโปรเจกต์นี้อยู่ (ผู้เรียกต้อง acquireTeam มาก่อนแล้ว) */
+export async function startPlan(admin: SupabaseClient, projectId: string, messageId: string, teamId: string): Promise<StartResult> {
   const { data: msg } = await admin
     .from('messages')
     .select('id, plan, plan_status')
@@ -91,7 +92,7 @@ export async function startPlan(admin: SupabaseClient, projectId: string, messag
     .select('id')
   if (!claimed || (claimed as unknown[]).length === 0) return { ok: false, error: 'แผนนี้ถูกใช้ไปแล้ว' }
 
-  const team = await loadTeam(admin, projectId)
+  const team = await loadTeam(admin, teamId)
   const lead = pickLead(team)
   const revert = async (created: string[]) => {
     if (created.length > 0) await admin.from('tasks').delete().in('id', created)
@@ -172,6 +173,8 @@ export interface LeadTurnInput {
   /** แยกเป็นพารามิเตอร์เพื่อให้ทดสอบโดยไม่เรียก AI จริง */
   complete: (req: CompletionRequest) => Promise<CompletionResult>
   project: { id: string; name: string; instructions: string; max_tasks_per_run: number }
+  /** ทีมที่ประจำโปรเจกต์นี้ (acquireTeam แล้ว) */
+  teamId: string
   team: TeamAgent[]
   lead: TeamAgent
   apiKey: string
@@ -202,13 +205,8 @@ function summarizeTasks(rows: Array<{ title: string; status: string; error: stri
 export async function runLeadTurn(i: LeadTurnInput): Promise<LeadTurnResult> {
   const { admin, project, team, lead } = i
 
-  const [histRes, pendRes, filesRes, tasksRes, pricesRes] = await Promise.all([
-    admin
-      .from('messages')
-      .select('id, role, content, task_id')
-      .eq('project_id', project.id)
-      .order('created_at', { ascending: false })
-      .limit(HISTORY_MESSAGES + 1),
+  const [mem, pendRes, filesRes, tasksRes, pricesRes] = await Promise.all([
+    loadMemory(admin, project.id),
     admin
       .from('messages')
       .select('id, plan')
@@ -236,11 +234,15 @@ export async function runLeadTurn(i: LeadTurnInput): Promise<LeadTurnResult> {
       .in('model', [...new Set(team.map((m) => m.model))]),
   ])
 
-  const history: ChatLine[] = ((histRes.data ?? []) as Array<{ id: string; role: ChatLine['role']; content: string; task_id: string | null }>)
-    .filter((m) => m.id !== i.userMessageId)
-    .slice(0, HISTORY_MESSAGES)
-    .reverse()
-    .map((m) => ({ role: m.role, content: m.content, isTaskResult: !!m.task_id }))
+  // ประวัติแชท = เฉพาะส่วนที่ยังไม่ถูกสรุปลง brief และพอดีงบ token (ของเก่ากว่านั้นอยู่ใน brief แล้ว)
+  const unsummarized = (await loadUnsummarized(admin, project.id, mem.summarized_through, HISTORY_FETCH + 1)).filter(
+    (m) => m.id !== i.userMessageId
+  )
+  const history: ChatLine[] = fitRecent(unsummarized, BUDGET.leadHistoryTokens).map((m) => ({
+    role: m.role,
+    content: m.content,
+    isTaskResult: !!m.task_id,
+  }))
 
   const pendingRow = pendRes.error ? null : (pendRes.data as { id: string; plan: StoredPlan | null } | null)
   const pendingPlan = pendingRow?.plan ?? null
@@ -261,6 +263,7 @@ export async function runLeadTurn(i: LeadTurnInput): Promise<LeadTurnResult> {
     filesTotal: filePaths.length,
     pendingPlan,
     taskStatus: summarizeTasks((tasksRes.data ?? []) as Array<{ title: string; status: string; error: string | null }>),
+    brief: mem.brief,
   })
 
   const result = await i.complete({
@@ -273,31 +276,13 @@ export async function runLeadTurn(i: LeadTurnInput): Promise<LeadTurnResult> {
   })
 
   // ค่าใช้จ่ายของการคุย (รวมเข้า spent_usd ของ project) — บันทึกพลาดไม่ทำให้การคุยล้ม
-  try {
-    const cost = await calculateCost(admin, lead.provider, lead.model, result.tokensIn, result.tokensOut)
-    const { error } = await admin.rpc('record_chat_usage', {
-      p_project_id: project.id,
-      p_provider: lead.provider,
-      p_model: lead.model,
-      p_tokens_in: result.tokensIn,
-      p_tokens_out: result.tokensOut,
-      p_cost_usd: cost,
-    })
-    if (error) {
-      // ยังไม่ได้รัน migration 0004 → อย่างน้อยให้ token ถูกนับในแท็บการใช้งาน
-      await admin.from('usage').insert({
-        project_id: project.id,
-        task_id: null,
-        provider: lead.provider,
-        model: lead.model,
-        tokens_in: result.tokensIn,
-        tokens_out: result.tokensOut,
-        cost_usd: cost,
-      })
-    }
-  } catch (e) {
-    console.error('[lead] บันทึก usage ไม่สำเร็จ:', e instanceof Error ? e.message : e)
-  }
+  await recordChatUsage(admin, {
+    projectId: project.id,
+    provider: lead.provider,
+    model: lead.model,
+    tokensIn: result.tokensIn,
+    tokensOut: result.tokensOut,
+  })
 
   const parsed = parseLeadOutput(result.text)
   let reply = parsed.reply
@@ -327,7 +312,7 @@ export async function runLeadTurn(i: LeadTurnInput): Promise<LeadTurnResult> {
   let started = false
   let taskCount = 0
   if (parsed.start && !plan && pendingRow) {
-    const r = await startPlan(admin, project.id, pendingRow.id)
+    const r = await startPlan(admin, project.id, pendingRow.id, i.teamId)
     started = r.ok
     if (r.ok) taskCount = r.taskCount
     else await admin.from('messages').insert({ project_id: project.id, role: 'assistant', content: `เริ่มงานไม่ได้: ${r.error}` })

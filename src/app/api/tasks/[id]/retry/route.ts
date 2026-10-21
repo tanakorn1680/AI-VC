@@ -2,6 +2,8 @@ import { requireUser } from '@/lib/supabase/auth'
 import { apiOk, apiError } from '@/lib/utils/api'
 import { isValidUUID } from '@/lib/utils/sanitize'
 import { enqueueTask } from '@/lib/orchestrator/queue'
+import { createAdminClient } from '@/lib/supabase/admin'
+import { acquireTeam, resolveProjectTeam } from '@/lib/team/team'
 
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id: taskId } = await params
@@ -9,6 +11,30 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
 
   const auth = await requireUser()
   if (!auth) return apiError('UNAUTHORIZED', 'ต้องล็อกอินก่อน')
+
+  // กติกา 1 โปรเจกต์ต่อทีม: ทีมของงานนี้ต้องประจำโปรเจกต์นี้ก่อนจึงจะทำต่อได้ (ถ้าทีมไปทำที่อื่นอยู่จะตอบ 409)
+  const { data: row } = await auth.supabase
+    .from('tasks')
+    .select('project_id, assigned_agent')
+    .eq('id', taskId)
+    .maybeSingle()
+  const t = row as { project_id: string; assigned_agent: string | null } | null
+  if (!t) return apiError('NOT_FOUND', 'ไม่พบ task นี้')
+  try {
+    let teamId: string | null = null
+    if (t.assigned_agent) {
+      const { data: agent } = await auth.supabase.from('agents').select('team_id').eq('id', t.assigned_agent).maybeSingle()
+      teamId = (agent as { team_id: string } | null)?.team_id ?? null
+    }
+    if (!teamId) {
+      const { data: project } = await auth.supabase.from('projects').select('id, team_id').eq('id', t.project_id).maybeSingle()
+      teamId = (await resolveProjectTeam(auth.supabase, auth.user.id, project as { id: string; team_id: string | null })).team.id
+    }
+    const acquired = await acquireTeam(createAdminClient(), teamId, t.project_id)
+    if (!acquired.ok) return apiError(acquired.reason === 'error' ? 'INTERNAL_ERROR' : 'CONFLICT', acquired.message)
+  } catch (e) {
+    return apiError('INTERNAL_ERROR', e instanceof Error ? e.message : 'โหลดทีมไม่สำเร็จ')
+  }
 
   // trigger tasks_status_guard อนุญาตแค่ failed/cancelled → pending และรีเซ็ต attempts ให้เอง
   // RLS กรองอยู่แล้วว่าต้องเป็นเจ้าของ project ของ task นี้

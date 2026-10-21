@@ -3,6 +3,7 @@ import { createAdminClient } from '@/lib/supabase/admin'
 import { apiOk, apiError, parseBody } from '@/lib/utils/api'
 import { isValidUUID } from '@/lib/utils/sanitize'
 import { startPlan, dismissPlan } from '@/lib/orchestrator/lead'
+import { acquireTeam, resolveProjectTeam } from '@/lib/team/team'
 
 export const maxDuration = 60
 
@@ -28,12 +29,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return ok ? apiOk({ ok: true }) : apiError('BAD_REQUEST', 'แผนนี้ไม่ได้รอการยืนยันแล้ว')
   }
 
-  const { data: project } = await auth.supabase.from('projects').select('budget_usd, spent_usd').eq('id', id).maybeSingle()
-  const p = project as { budget_usd: number | null; spent_usd: number } | null
+  const { data: project } = await auth.supabase.from('projects').select('budget_usd, spent_usd, team_id').eq('id', id).maybeSingle()
+  const p = project as { budget_usd: number | null; spent_usd: number; team_id: string | null } | null
   if (p && p.budget_usd !== null && Number(p.spent_usd) >= Number(p.budget_usd)) {
     return apiError('BUDGET_EXCEEDED', 'ใช้งบของโปรเจกต์นี้ครบแล้ว — เพิ่มงบก่อนจึงจะเริ่มงานได้')
   }
 
-  const r = await startPlan(admin, id, messageId)
+  // กติกา 1 โปรเจกต์ต่อทีม: ทีมต้องประจำโปรเจกต์นี้ก่อนเริ่มงาน
+  let teamId: string
+  try {
+    teamId = (await resolveProjectTeam(auth.supabase, auth.user.id, { id, team_id: p?.team_id ?? null })).team.id
+  } catch (e) {
+    return apiError('INTERNAL_ERROR', e instanceof Error ? e.message : 'โหลดทีมไม่สำเร็จ')
+  }
+  const acquired = await acquireTeam(admin, teamId, id)
+  if (!acquired.ok) return apiError(acquired.reason === 'error' ? 'INTERNAL_ERROR' : 'CONFLICT', acquired.message)
+
+  const r = await startPlan(admin, id, messageId, teamId)
   return r.ok ? apiOk({ ok: true, tasks: r.taskCount }) : apiError('BAD_REQUEST', r.error)
 }

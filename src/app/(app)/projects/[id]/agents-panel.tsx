@@ -72,11 +72,12 @@ function DutyChips({ onPick }: { onPick: (v: string) => void }) {
 // หน้าหลัก
 // ---------------------------------------------------------------------------
 export default function AgentsPanel({
-  projectId,
+  apiBase,
   agents,
   onChanged,
 }: {
-  projectId: string
+  /** เส้นทาง API ของทีม เช่น /api/teams/<teamId> — AI เป็นของทีม ใช้ร่วมกันทุกโปรเจกต์ */
+  apiBase: string
   agents: Agent[]
   onChanged: () => void | Promise<void>
 }) {
@@ -86,9 +87,9 @@ export default function AgentsPanel({
   return (
     <section className="space-y-4">
       <div>
-        <h2 className="text-base font-semibold text-neutral-100">ทีม AI ของคุณ</h2>
+        <h2 className="text-base font-semibold text-neutral-100">AI ในทีม</h2>
         <p className="mt-1 text-sm leading-relaxed text-neutral-400">
-          เพิ่ม AI ได้กี่ตัวก็ได้ แค่วาง API key แล้วเลือกโมเดล หัวหน้าทีมจะคุยกับคุณและแบ่งงานให้ตัวอื่นเองอย่างประหยัดที่สุด
+          AI ชุดนี้ใช้ร่วมกันได้ทุกโปรเจกต์ (ทีมทำได้ทีละ 1 โปรเจกต์) เพิ่มกี่ตัวก็ได้ แค่วาง API key แล้วเลือกโมเดล หัวหน้าทีมจะคุยกับคุณและมอบงานให้ตัวอื่นเอง
         </p>
       </div>
 
@@ -113,7 +114,7 @@ export default function AgentsPanel({
         {agents.map((a) => (
           <li key={a.id}>
             <AgentCard
-              projectId={projectId}
+              apiBase={apiBase}
               agent={a}
               isLead={a.role === 'manager'}
               onChanged={onChanged}
@@ -125,7 +126,7 @@ export default function AgentsPanel({
 
       {adding ? (
         <AddAgent
-          projectId={projectId}
+          apiBase={apiBase}
           isFirst={agents.length === 0}
           onCancel={() => setAdding(false)}
           onDone={(name, first) => {
@@ -159,12 +160,12 @@ type Probe =
   | { kind: 'fail'; reason: string; message: string }
 
 function AddAgent({
-  projectId,
+  apiBase,
   isFirst,
   onCancel,
   onDone,
 }: {
-  projectId: string
+  apiBase: string
   isFirst: boolean
   onCancel: () => void
   onDone: (name: string, first: boolean) => void
@@ -180,6 +181,7 @@ function AddAgent({
   const [priceIn, setPriceIn] = useState('')
   const [priceOut, setPriceOut] = useState('')
   const [canWrite, setCanWrite] = useState(true)
+  const [kind, setKind] = useState<'worker' | 'reviewer'>('worker')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
@@ -230,7 +232,7 @@ function AddAgent({
     setBusy(true)
     setError('')
     const hasPrice = priceIn.trim() !== '' || priceOut.trim() !== ''
-    const { ok, data } = await call(`/api/projects/${projectId}/agents`, {
+    const { ok, data } = await call(`${apiBase}/agents`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({
@@ -241,6 +243,7 @@ function AddAgent({
         name: name.trim() || undefined,
         duty: duty.trim() || undefined,
         can_write_files: canWrite,
+        kind: isFirst ? undefined : kind,
         ...(hasPrice ? { price_in: Number(priceIn || 0), price_out: Number(priceOut || 0) } : {}),
       }),
     }).catch(() => ({ ok: false, data: { error: 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้' } }))
@@ -342,6 +345,14 @@ function AddAgent({
                 <input value={duty} onChange={(e) => setDuty(e.target.value)} maxLength={300} placeholder="เช่น เขียนโค้ด" className={inputCls} />
                 <DutyChips onPick={setDuty} />
               </Field>
+              {!isFirst && (
+                <Field label="บทบาท" hint="ผู้ตรวจ = ตรวจผลงานของ AI ตัวอื่นก่อนส่งมอบ (หัวหน้าทีมจะเพิ่มงานตรวจให้เองเมื่อชิ้นงานสำคัญ)">
+                  <select value={kind} onChange={(e) => setKind(e.target.value as 'worker' | 'reviewer')} className={inputCls}>
+                    <option value="worker">ผู้ทำงาน</option>
+                    <option value="reviewer">ผู้ตรวจ</option>
+                  </select>
+                </Field>
+              )}
               <Field label="ชื่อ" hint="ถ้าไม่ตั้ง ระบบจะใช้ชื่อโมเดล">
                 <input value={name} onChange={(e) => setName(e.target.value)} maxLength={100} placeholder="เช่น นักเขียน" className={inputCls} />
               </Field>
@@ -366,7 +377,7 @@ function AddAgent({
       )}
 
       {isFirst && detected && (
-        <p className="text-xs leading-relaxed text-neutral-500">AI ตัวแรกจะเป็นหัวหน้าทีม: คุยกับคุณ ถามกลับเมื่อข้อมูลไม่พอ แล้วแบ่งงานให้ AI ตัวอื่น</p>
+        <p className="text-xs leading-relaxed text-neutral-500">AI ตัวแรกจะเป็นหัวหน้าทีม (ผู้ประสานงาน): คุยกับคุณ ถามกลับเมื่อข้อมูลไม่พอ แล้วมอบงานให้ AI ตัวอื่นตามหน้าที่</p>
       )}
 
       {error && (
@@ -391,13 +402,13 @@ function AddAgent({
 // การ์ด AI แต่ละตัว
 // ---------------------------------------------------------------------------
 function AgentCard({
-  projectId,
+  apiBase,
   agent,
   isLead,
   onChanged,
   onNotice,
 }: {
-  projectId: string
+  apiBase: string
   agent: Agent
   isLead: boolean
   onChanged: () => void | Promise<void>
@@ -409,6 +420,7 @@ function AgentCard({
   const [model, setModel] = useState(agent.model)
   const [newKey, setNewKey] = useState('')
   const [canWrite, setCanWrite] = useState(agent.allowed_tools?.includes('write_file') ?? true)
+  const [kind, setKind] = useState<'worker' | 'reviewer'>(agent.role === 'reviewer' ? 'reviewer' : 'worker')
   const [models, setModels] = useState<ModelOption[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -417,7 +429,7 @@ function AgentCard({
   useEffect(() => {
     if (!editing) return
     let cancelled = false
-    void call(`/api/projects/${projectId}/agents/${agent.id}/models`)
+    void call(`${apiBase}/agents/${agent.id}/models`)
       .then(({ ok, data }) => {
         if (!cancelled && ok && Array.isArray(data.models)) setModels(data.models as ModelOption[])
       })
@@ -425,7 +437,7 @@ function AgentCard({
     return () => {
       cancelled = true
     }
-  }, [editing, projectId, agent.id])
+  }, [editing, apiBase, agent.id])
 
   function openEditor() {
     setName(agent.name)
@@ -433,6 +445,7 @@ function AgentCard({
     setModel(agent.model)
     setNewKey('')
     setCanWrite(agent.allowed_tools?.includes('write_file') ?? true)
+    setKind(agent.role === 'reviewer' ? 'reviewer' : 'worker')
     setError('')
     setEditing(true)
   }
@@ -440,7 +453,7 @@ function AgentCard({
   async function patch(body: Record<string, unknown>, okMessage?: string): Promise<boolean> {
     setBusy(true)
     setError('')
-    const { ok, data } = await call(`/api/projects/${projectId}/agents/${agent.id}`, {
+    const { ok, data } = await call(`${apiBase}/agents/${agent.id}`, {
       method: 'PATCH',
       headers: JSON_HEADERS,
       body: JSON.stringify(body),
@@ -463,6 +476,7 @@ function AgentCard({
     if (model.trim() !== agent.model) body.model = model.trim()
     if (newKey.trim()) body.api_key = newKey.trim()
     if (canWrite !== (agent.allowed_tools?.includes('write_file') ?? true)) body.can_write_files = canWrite
+    if (!isLead && kind !== (agent.role === 'reviewer' ? 'reviewer' : 'worker')) body.kind = kind
     if (Object.keys(body).length === 0) {
       setEditing(false)
       return
@@ -474,9 +488,9 @@ function AgentCard({
   }
 
   async function remove() {
-    if (!window.confirm(`ลบ ${agent.name} ออกจากทีม? API key ของ AI ตัวนี้จะถูกลบด้วย`)) return
+    if (!window.confirm(`ลบ ${agent.name} ออกจากทีม? จะหายไปจากทุกโปรเจกต์ และ API key ของ AI ตัวนี้จะถูกลบด้วย`)) return
     setBusy(true)
-    const { ok, data } = await call(`/api/projects/${projectId}/agents/${agent.id}`, { method: 'DELETE' }).catch(() => ({
+    const { ok, data } = await call(`${apiBase}/agents/${agent.id}`, { method: 'DELETE' }).catch(() => ({
       ok: false,
       data: { error: 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้' },
     }))
@@ -505,6 +519,7 @@ function AgentCard({
           <div className="flex flex-wrap items-center gap-2">
             <p className="break-words text-[15px] font-semibold text-neutral-100">{agent.name}</p>
             {isLead && <span className="rounded-full bg-indigo-600/20 px-2.5 py-0.5 text-xs font-medium text-indigo-300">หัวหน้าทีม</span>}
+            {agent.role === 'reviewer' && <span className="rounded-full bg-amber-600/20 px-2.5 py-0.5 text-xs font-medium text-amber-300">ผู้ตรวจ</span>}
           </div>
           <p className="mt-0.5 break-all font-mono text-xs text-neutral-500">
             {agent.model} · {providerLabel(agent.provider)}
@@ -521,7 +536,7 @@ function AgentCard({
         <div className="mt-3 space-y-1 text-sm">
           <p className="text-neutral-300">
             <span className="text-neutral-500">หน้าที่: </span>
-            {agent.duty || (isLead ? 'คุยกับคุณและแบ่งงานให้ทีม' : 'ทำได้ทุกอย่าง — หัวหน้าทีมเลือกงานให้ตามความถนัด')}
+            {agent.duty || (isLead ? 'คุยกับคุณและมอบงานให้ทีม' : agent.role === 'reviewer' ? 'ตรวจผลงานของ AI ตัวอื่น' : 'ทำได้ทุกอย่าง — หัวหน้าทีมเลือกงานให้ตามความถนัด')}
           </p>
           <p className="text-xs">{keyLine}</p>
         </div>
@@ -563,6 +578,14 @@ function AgentCard({
               className={inputCls}
             />
           </Field>
+          {!isLead && (
+            <Field label="บทบาท" hint="ผู้ตรวจ = ตรวจผลงานของ AI ตัวอื่นก่อนส่งมอบ">
+              <select value={kind} onChange={(e) => setKind(e.target.value as 'worker' | 'reviewer')} className={inputCls}>
+                <option value="worker">ผู้ทำงาน</option>
+                <option value="reviewer">ผู้ตรวจ</option>
+              </select>
+            </Field>
+          )}
           <label className="flex min-h-11 cursor-pointer items-start gap-3 text-sm text-neutral-200">
             <input type="checkbox" checked={canWrite} onChange={(e) => setCanWrite(e.target.checked)} className="mt-1 h-4 w-4 shrink-0 accent-indigo-600" />
             <span>ให้ AI ตัวนี้สร้างและแก้ไฟล์ในโปรเจกต์ได้</span>

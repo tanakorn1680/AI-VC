@@ -6,6 +6,7 @@ export type ApiErrorCode =
   | 'NOT_FOUND'
   | 'BAD_REQUEST'
   | 'RATE_LIMITED'
+  | 'CONFLICT'
   | 'BUDGET_EXCEEDED'
   | 'INTERNAL_ERROR'
 
@@ -14,6 +15,7 @@ const STATUS_MAP: Record<ApiErrorCode, number> = {
   FORBIDDEN:       403,
   NOT_FOUND:       404,
   BAD_REQUEST:     400,
+  CONFLICT:        409,
   RATE_LIMITED:    429,
   BUDGET_EXCEEDED: 402,
   INTERNAL_ERROR:  500,

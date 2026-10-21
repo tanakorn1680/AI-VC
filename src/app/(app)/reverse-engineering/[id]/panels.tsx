@@ -48,18 +48,18 @@ const TASK_TONE: Record<string, string> = {
 }
 
 async function loadAgentOptions(supabase: Db): Promise<AgentOption[]> {
-  // RLS ของ agents/projects กรองให้เห็นเฉพาะของผู้ใช้เอง
-  const [{ data: agents }, { data: projects }] = await Promise.all([
-    supabase.from('agents').select('id, name, provider, model, project_id').order('created_at', { ascending: false }).limit(100),
-    supabase.from('projects').select('id, name').limit(200),
+  // RLS ของ agents/teams กรองให้เห็นเฉพาะของผู้ใช้เอง — agent เป็นของ "ทีม" (ใช้ร่วมกันทุกโปรเจกต์)
+  const [{ data: agents }, { data: teams }] = await Promise.all([
+    supabase.from('agents').select('id, name, provider, model, team_id').order('created_at', { ascending: false }).limit(100),
+    supabase.from('teams').select('id, name').limit(50),
   ])
-  const names = new Map(((projects ?? []) as { id: string; name: string }[]).map((p) => [p.id, p.name]))
-  return ((agents ?? []) as { id: string; name: string; provider: string; model: string; project_id: string }[]).map((a) => ({
+  const names = new Map(((teams ?? []) as { id: string; name: string }[]).map((t) => [t.id, t.name]))
+  return ((agents ?? []) as { id: string; name: string; provider: string; model: string; team_id: string }[]).map((a) => ({
     id: a.id,
     name: a.name,
     provider: a.provider,
     model: a.model,
-    projectName: names.get(a.project_id) ?? '-',
+    projectName: names.get(a.team_id) ?? '-',
   }))
 }
 

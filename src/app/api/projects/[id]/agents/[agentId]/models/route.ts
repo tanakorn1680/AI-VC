@@ -1,35 +1,10 @@
-import { requireUser } from '@/lib/supabase/auth'
-import { createAdminClient } from '@/lib/supabase/admin'
-import { apiOk, apiError } from '@/lib/utils/api'
-import { isValidUUID } from '@/lib/utils/sanitize'
-import { resolveAgentKey } from '@/lib/ai/agent-key'
-import { listModels, ListModelsError } from '@/lib/ai/list-models'
+import { apiError } from '@/lib/utils/api'
 
-/** รายชื่อโมเดลที่ key ของ agent ตัวนี้ใช้ได้ — ใช้ตอนเปลี่ยนโมเดล (key ไม่ถูกส่งกลับไปที่ browser) */
-export async function GET(_req: Request, { params }: { params: Promise<{ id: string; agentId: string }> }) {
-  const { id, agentId } = await params
-  if (!isValidUUID(id) || !isValidUUID(agentId)) return apiError('BAD_REQUEST', 'id ไม่ถูกต้อง')
+/**
+ * เลิกใช้แล้ว — AI เป็นของ "ทีม" ใช้ร่วมกันทุกโปรเจกต์ ใช้ /api/teams/:teamId/agents แทน
+ * (หน้าโปรเจกต์ดูทีมของโปรเจกต์ได้ที่ GET /api/projects/:id/team)
+ * คงไฟล์ไว้เป็น stub เพื่อให้การแตกไฟล์ทับ repo เดิมไม่ทิ้งโค้ดเก่าที่ยังผูก agent กับโปรเจกต์
+ */
+const gone = () => apiError('BAD_REQUEST', 'เส้นทางนี้เลิกใช้แล้ว — AI เป็นของทีม ใช้ /api/teams/:teamId/agents แทน')
 
-  const auth = await requireUser()
-  if (!auth) return apiError('UNAUTHORIZED', 'ต้องล็อกอินก่อน')
-
-  const { data } = await auth.supabase
-    .from('agents')
-    .select('id, provider, base_url')
-    .eq('id', agentId)
-    .eq('project_id', id)
-    .maybeSingle()
-  const agent = data as { id: string; provider: string; base_url: string | null } | null
-  if (!agent) return apiError('NOT_FOUND', 'ไม่พบ AI ตัวนี้')
-
-  const apiKey = await resolveAgentKey(createAdminClient(), agent, auth.user.id)
-  if (!apiKey) return apiError('BAD_REQUEST', 'AI ตัวนี้ยังไม่มี API key')
-
-  try {
-    const { models, source } = await listModels(agent.provider, apiKey, agent.base_url)
-    return apiOk({ models, source })
-  } catch (e) {
-    if (e instanceof ListModelsError) return apiError(e.kind === 'upstream' ? 'INTERNAL_ERROR' : 'BAD_REQUEST', e.message)
-    return apiError('INTERNAL_ERROR', 'ดึงรายชื่อรุ่นไม่สำเร็จ')
-  }
-}
+export const GET = gone
