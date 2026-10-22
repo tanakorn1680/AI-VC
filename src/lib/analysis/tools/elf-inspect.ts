@@ -1,7 +1,8 @@
 import { BUILTIN_TIMEOUT_MS, MAX_ARTIFACT_BYTES } from '../limits'
 import type { ToolAdapter, ToolInput, ToolProbe, ToolResult } from '../tool-adapter'
+import { topFamilies } from './symbol-families'
 
-const VERSION = '1.0.0'
+const VERSION = '1.1.0'
 
 const MAX_SECTIONS_LISTED = 120
 const MAX_SYMBOLS_LISTED = 400
@@ -369,6 +370,10 @@ export function inspectElf(input: ToolInput): ToolResult {
           strings_found: strings.total,
         },
         stripped,
+        // สรุปทั้งตาราง symbol (ไม่ใช่แค่ตัวอย่าง): ตระกูลชื่อที่พบมากสุด และ section ที่ชื่อไม่ขึ้นต้นด้วยจุด (ไม่ใช่ section มาตรฐาน)
+        export_families: topFamilies(exports.map((s) => s.name), 12),
+        import_families: topFamilies(importNames, 12),
+        unusual_sections: sections.filter((s) => s.name && !s.name.startsWith('.')).map((s) => ({ name: s.name, size: s.size })).slice(0, 20),
         notes,
         jni_exports: jni.slice(0, MAX_SYMBOLS_LISTED).map((s) => s.name),
         interesting_strings: {

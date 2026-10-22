@@ -61,6 +61,15 @@ Multi-Agent AI Workspace — Next.js (App Router) + Supabase + Vercel, BYOK (ผ
 - UI: `analyst-settings.tsx` ไม่มี dropdown เลือก agent แล้ว — แสดงสมาชิกทีม+เพดานของแต่ละตัว (เลือกทีมได้ถ้ามีหลายทีม)
 - ไม่ต้องล็อกทีม (RE ไม่ใช่โปรเจกต์) — ทีมที่ประจำโปรเจกต์อยู่ใช้ทำ RE พร้อมกันได้ (ระวัง rate limit ร่วมกัน)
 
+### 4.5 ZIP ที่มี .so หลายไฟล์ + ผลเครื่องมือยาว (รอบ 3 — ไม่มี migration)
+- **ปัญหาที่ผู้ใช้เจอ**: อัปโหลด `arm64-v8a.zip` (25 ไฟล์ .so) ได้แค่รายชื่อไฟล์ — `elf-inspect` รับเฉพาะ ELF ตรง ๆ ไม่มีเครื่องมือที่คลาย ZIP แล้วตรวจ .so ข้างใน
+- **เครื่องมือใหม่ `zip-elf-inspect`** (`tools/zip-elf-inspect.ts`, ลงทะเบียนใน `tool-registry.ts`): คลายทีละไฟล์ในหน่วยความจำ (fflate; เพดาน 40 ไฟล์/64MB ต่อไฟล์/256MB รวม/20 วินาที) ตรวจ ELF จากไบต์จริง (ไม่ดูนามสกุลอย่างเดียว) ได้ตารางต่อไลบรารี (soname, needed, JNI, hardening, ตระกูล symbol, section ผิดปกติ, URL, compiler) + `internal_dependencies` (ใครต้องใช้ใครในแพ็ก) + `external_needed_libraries`
+- `elf-inspect` v1.1.0 เพิ่ม `export_families`/`import_families` (สรุปทั้งตาราง symbol ด้วย `tools/symbol-families.ts` — เดาจากชื่อ ไม่ใช่การยืนยัน) และ `unusual_sections` (section ชื่อไม่ขึ้นต้นด้วยจุด เช่น `alyn` ใน libGTASA)
+- **สรุปผลยาว**: ผลเครื่องมือถูกย่อ JSON (ไม่มีช่องว่าง) แล้วหั่นเป็นส่วน (`part_chars` ≤12,000 ตัวอักษร และเล็กพอให้ทุก agent ที่ใช้ได้รับได้; รวมต่อ run ≤96,000) ให้ agent หลายตัวอ่านคนละส่วนพร้อมกัน (เดิมตัดเหลือ 12,000 ตัวอักษรแรก ทำให้ไม่เห็น export/section ท้ายไฟล์). `config.analysis.done` เก็บ `runId:เลขส่วน`
+- `planWave` เลือกตัวที่ "เต็มน้อยที่สุดตามสัดส่วนความจุ" — ตัวใหญ่รับงานเป็นหลัก ตัวเล็ก (เช่น Groq 8k) รับเมื่อมีงานพอ/เป็นตัวสำรอง
+- ไฟล์: `tools/zip-elf-inspect.ts`, `tools/symbol-families.ts`, `tools/elf-inspect.ts`, `tool-registry.ts`, `findings.ts` (PromptItem), `team-pool.ts` (planWave/partCharsFor), `orchestrator.ts` (analyzeStep/analyzeWave)
+- ทดสอบแล้ว: `zip-elf-inspect` กับ ZIP ที่มี .so จริง 12 ไฟล์ (self-test + ผลจริง); ยังไม่ได้ยิง AI จริง/ไม่ได้ทดสอบกับ `arm64-v8a.zip` ของผู้ใช้ (ไฟล์ .so ไม่ได้อยู่ในมือ)
+
 ## 5. แผนที่ไฟล์ที่เกี่ยวข้อง
 ```
 supabase/migrations/0010_shared_teams.sql      teams, agents.team_id, acquire/release_team, project_memory
@@ -102,6 +111,7 @@ RE ทีม (รอบ 2): `lib/analysis/team-pool.ts` (pool/เพดาน/�
 - `agents.project_id` (nullable, ไม่ใช้แล้ว) ลบได้ในอนาคตเมื่อมั่นใจ; `lib/orchestrator/planner.ts` เป็นโค้ดเก่าที่ไม่ถูกเรียกแล้ว
 
 - RE: เพดานเริ่มต้นของ Groq ตั้งไว้ 6–8k (แพ็กเกจจ่ายเงินสูงกว่านั้น แต่ระบบไม่ปรับขึ้นเอง) — ถ้าต้องการ ให้เพิ่มช่องตั้ง "เพดานคำขอ" ต่อ agent
+- RE: ZIP ที่ใหญ่เกิน 25MB (`MAX_ARTIFACT_BYTES`) อัปโหลดไม่ได้ และ .so เดี่ยวใน ZIP ที่เกิน 64MB ถูกข้าม (เช่น `libsimcity.so` 37MB ผ่าน)
 - RE: ผู้ตรวจทานตรวจได้ ≤40 ข้อค้นพบต่อรอบ และถ้าทั้งทีมเล็กเกินจะข้ามรีวิว; spec/report (`report-service.ts`) ยังเรียกตัวเดียว (เลือกตัวใหญ่สุด) ไม่แบ่งชุด
 - `analyst_agent_id` ยังอยู่ใน DB/API เพื่อความเข้ากันได้ย้อนหลัง แต่ UI ไม่ใช้แล้ว
 

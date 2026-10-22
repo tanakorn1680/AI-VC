@@ -190,14 +190,18 @@ export function planWave<T extends { len: number }>(
   if (usable.length === 0) return []
 
   const shards = usable.map((u) => ({ member: u.m, capChars: u.cap, left: u.cap, items: [] as Shard<T>['items'] }))
-  const sorted = [...items].sort((a, b) => Math.min(b.len, MAX_RUN_CHARS) - Math.min(a.len, MAX_RUN_CHARS))
+  const maxCap = usable[0]!.cap // ตัวที่จุได้มากสุด
+  const sorted = [...items].sort((a, b) => b.len - a.len)
+  const byLeft = (a: { left: number }, b: { left: number }) => b.left - a.left
   for (const it of sorted) {
-    const want = Math.max(1, Math.min(it.len, MAX_RUN_CHARS))
-    const byLeft = (a: { left: number }, b: { left: number }) => b.left - a.left
-    let target = shards.filter((s) => s.left >= want).sort(byLeft)[0]
+    const want = Math.max(1, it.len)
+    // รับครบก่อน: เลือกตัวที่ "เต็มน้อยที่สุด" หลังรับก้อนนี้ (สัดส่วนต่อความจุของตัวนั้น) — ทุกตัวได้ใช้งานตามกำลัง ไม่กองไว้ที่ตัวใหญ่ตัวเดียว
+    const fill = (s: { capChars: number; left: number }) => (s.capChars - s.left + want) / s.capChars
+    let target = shards.filter((s) => s.left >= want).sort((a, b) => fill(a) - fill(b))[0]
     let chars = want
     if (!target) {
-      // ไม่มีตัวไหนรับครบ: ยอมตัดท้ายถ้ายังเหลือที่พอ (ผลเต็มยังใช้ตรวจหลักฐานเสมอ)
+      // ก้อนที่ใหญ่เกินกว่าตัวไหนจะรับได้ครบเลย: ยอมตัดท้าย (ผลเต็มยังใช้ตรวจหลักฐานเสมอ); ก้อนที่รับได้ แต่รอบนี้เต็ม → ค้างไว้รอบถัดไป
+      if (want <= maxCap) continue
       target = shards.filter((s) => s.left >= MIN_SLICE_CHARS).sort(byLeft)[0]
       if (!target) continue
       chars = target.left
@@ -206,6 +210,21 @@ export function planWave<T extends { len: number }>(
     target.left -= chars
   }
   return shards.filter((s) => s.items.length > 0).map(({ member, capChars, items: its }) => ({ member, capChars, items: its }))
+}
+
+/** ผลเครื่องมือหนึ่ง run ส่งให้ทีมอ่านได้รวมไม่เกินกี่ตัวอักษร (คุมค่า token) */
+export const MAX_RUN_TOTAL_CHARS = 96_000
+const MIN_PART_CHARS = 4_000
+
+/**
+ * ความยาวของส่วน (part) ที่หั่นผลเครื่องมือ: ไม่เกิน MAX_RUN_CHARS และเล็กพอให้ "ทุกตัวที่ใช้งานได้" รับได้ทั้งส่วน
+ * (ตัวที่จุได้ต่ำกว่า MIN_PART_CHARS ไม่นับ — ไม่คุ้มที่จะหั่นให้เล็กตาม)
+ */
+export function partCharsFor(members: PoolMember[], fixedTokens: number): number {
+  const caps = members.map((m) => shardCapChars(m, fixedTokens))
+  const usable = caps.filter((c) => c >= MIN_PART_CHARS)
+  const base = usable.length > 0 ? Math.min(...usable) : Math.max(0, ...caps)
+  return Math.max(MIN_SHARD_CHARS, Math.min(MAX_RUN_CHARS, Math.floor(base)))
 }
 
 /** ใหญ่สุดในทีม (ไว้บอกผู้ใช้ตอนไม่มีตัวไหนรับได้) */

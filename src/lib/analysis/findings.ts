@@ -5,9 +5,6 @@ import { UNTRUSTED_RULES, wrapUntrusted } from './security'
 export const MAX_FINDINGS = 20
 export const MAX_EVIDENCE_PER_FINDING = 6
 export const MAX_LIMITATIONS = 10
-// เพดานผลลัพธ์ของเครื่องมือหนึ่ง run ที่ส่งให้โมเดลอ่าน (คุม token) — การตรวจหลักฐานใช้ผลเต็มเสมอ
-const MAX_OUTPUT_CHARS_PER_RUN = 12_000
-const MAX_TOTAL_CHARS = 40_000
 
 export interface RunOutput {
   runId: string
@@ -36,9 +33,18 @@ ${UNTRUSTED_RULES}
 - confidence เป็นเพียงข้อเสนอ ระบบจะคำนวณระดับจริงจากหลักฐานที่ตรวจผ่านแล้ว
 - needs_more ใช้เมื่อยังมี artifact ที่ยังไม่ถูกตรวจด้วยเครื่องมือที่รองรับ มิฉะนั้นให้เป็น []`
 
+/** ส่วนหนึ่ง (part) ของผลเครื่องมือ — ผลที่ยาวถูกหั่นเป็นหลายส่วนให้ agent คนละตัวอ่านพร้อมกัน */
+export interface PromptItem {
+  run: RunOutput
+  part: number
+  parts: number
+  start: number
+  end: number
+  /** true = ผลส่วนท้ายถูกตัดทิ้ง (เกินเพดานจำนวนส่วนต่อผล หรือเกินความจุของ agent) */
+  cut?: boolean
+}
+
 export interface FindingsPromptOptions {
-  /** ตัวอักษรที่ให้อ่านต่อ run (โหมดทีม: แบ่งตามความจุของ agent แต่ละตัว) — ไม่ระบุ = ใช้เพดานเดิม */
-  slices?: Map<string, number>
   /** บอกโมเดลว่านี่เป็นชุดย่อย เพื่อไม่ให้สรุปเกินขอบเขตข้อมูลที่เห็น */
   shardNote?: string
 }
@@ -49,17 +55,15 @@ export const findingsSystemPrompt = (maxFindings?: number): string =>
 
 export function buildFindingsPrompt(
   goal: string,
-  runs: RunOutput[],
+  items: PromptItem[],
   uninspected: { artifact_id: string; name: string; supported_tools: string[] }[],
   opts: FindingsPromptOptions = {}
 ): string {
-  let budget = MAX_TOTAL_CHARS
-  const blocks = runs.map((r) => {
-    const limit = opts.slices?.get(r.runId) ?? Math.min(MAX_OUTPUT_CHARS_PER_RUN, Math.max(budget, 500))
-    const slice = r.fullText.slice(0, limit)
-    budget -= slice.length
-    const truncated = slice.length < r.fullText.length ? '\n[ตัดผลลัพธ์ส่วนที่เหลือเพื่อประหยัด token]' : ''
-    return `run_id: ${r.runId}\ntool_id: ${r.toolId}\ninput_file: ${r.artifactName}\n${wrapUntrusted(`tool-output:${r.runId}`, slice + truncated)}`
+  const blocks = items.map((it) => {
+    const slice = it.run.fullText.slice(it.start, it.end)
+    const tail = it.cut ? '\n[ตัดผลลัพธ์ส่วนที่เหลือเพื่อประหยัด token]' : ''
+    const partNote = it.parts > 1 ? `\npart: ${it.part + 1}/${it.parts} (ส่วนหนึ่งของผลลัพธ์ run เดียวกัน)` : ''
+    return `run_id: ${it.run.runId}\ntool_id: ${it.run.toolId}\ninput_file: ${it.run.artifactName}${partNote}\n${wrapUntrusted(`tool-output:${it.run.runId}`, slice + tail)}`
   })
   return [
     `เป้าหมายของผู้ใช้:\n${goal || '(ผู้ใช้ไม่ได้ระบุ — สรุปโครงสร้างโดยรวมของไฟล์)'}`,

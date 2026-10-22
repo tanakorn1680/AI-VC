@@ -8,10 +8,12 @@ import { estimateTokens } from '@/lib/orchestrator/context-budget'
 import { AnalysisFormatError, PromptTooLargeError, completeJson, type JsonCompletion } from './llm'
 import {
   PER_CALL_TOKEN_CAP,
+  MAX_RUN_TOTAL_CHARS,
   largestLimit,
   loadAnalystPool,
   orderPool,
   outputBudgetFor,
+  partCharsFor,
   planWave,
   type PoolMember,
   type PoolPrefer,
@@ -37,6 +39,7 @@ import {
   findingsSystemPrompt,
   processFindings,
   type ProcessedFindings,
+  type PromptItem,
   type RunOutput,
 } from './findings'
 
@@ -80,8 +83,10 @@ export interface SessionRow {
 
 /** สถานะการสรุปผลแบบทีม (หลาย agent ช่วยกันอ่านผลเครื่องมือคนละชุด) — อยู่ใน config เพื่อทำต่อได้หลังหยุดกลางทาง */
 export interface AnalysisState {
-  /** run ที่สรุปแล้วในรอบนี้ */
+  /** ส่วน (part) ของผลเครื่องมือที่สรุปแล้วในรอบนี้ — รูปแบบ `${runId}:${เลขส่วน}` */
   done: string[]
+  /** ความยาวต่อส่วน (ตัวอักษร) ที่ใช้หั่นผลในรอบนี้ — เก็บไว้เพื่อให้ขอบเขตส่วนเหมือนเดิมทุก step */
+  part_chars: number
   /** ข้อเสนอขอเครื่องมือเพิ่มจากทุกชุด (ยังไม่ผ่าน parsePlan) */
   needs_more: unknown[]
   reviewed: boolean
@@ -518,7 +523,21 @@ async function execStep(
 // ทำทีละ "รอบ (wave)" ต่อหนึ่ง step; ความคืบหน้าอยู่ใน config.analysis จึงหยุดแล้วทำต่อได้
 // ---------------------------------------------------------------------------
 const NEEDS_MORE_CAP = 10
+
+/** ตัดช่องว่าง/การเยื้องของ JSON ออก (ประหยัด token ราว 30%) — ใช้ข้อความนี้ทั้งส่งให้โมเดลและตรวจหลักฐาน */
+function compactJson(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text))
+  } catch {
+    return text
+  }
+}
 const CONF_RANK: Record<string, number> = { unverified: 0, low: 1, medium: 2, high: 3 }
+
+interface PartItem extends PromptItem {
+  key: string
+  len: number
+}
 
 async function analyzeStep(
   admin: SupabaseClient,
@@ -559,7 +578,7 @@ async function analyzeStep(
         toolId: r.tool_id,
         artifactName: sources.find((a) => a.id === r.input.artifact_id)?.name ?? '(ไม่ทราบ)',
         outputArtifactId: out.id,
-        fullText: new TextDecoder().decode(bytes),
+        fullText: compactJson(new TextDecoder().decode(bytes)),
         summary: r.output_summary,
       })
     } catch (e) {
@@ -577,13 +596,29 @@ async function analyzeStep(
   let state = session.config?.analysis
   if (!state) {
     await admin.from('analysis_findings').delete().eq('session_id', sid)
-    state = { done: [], needs_more: [], reviewed: false, wave: 0 }
+    const fixedTokens = estimateTokens(FINDINGS_SYSTEM_PROMPT) + estimateTokens(session.goal) + 600
+    state = { done: [], part_chars: partCharsFor(pool, fixedTokens), needs_more: [], reviewed: false, wave: 0 }
     await saveConfig(admin, session, { analysis: state })
   }
 
+  // หั่นผลที่ยาวเป็นหลายส่วน (ไม่เกิน MAX_PARTS_PER_RUN) ให้ agent หลายตัวอ่านคนละส่วนพร้อมกัน
+  const partChars = state.part_chars || 12_000
   const doneSet = new Set(state.done)
-  const remaining = outputs.filter((o) => !doneSet.has(o.runId))
-  if (remaining.length > 0) return analyzeWave(admin, session, pool, sources, outputs, remaining, state)
+  const remaining: PartItem[] = []
+  for (const o of outputs) {
+    const total = Math.max(1, Math.ceil(o.fullText.length / partChars))
+    const parts = Math.min(total, Math.max(1, Math.ceil(MAX_RUN_TOTAL_CHARS / partChars))) // เพดานรวมต่อ run คุมค่า token
+    for (let i = 0; i < parts; i++) {
+      if (doneSet.has(`${o.runId}:${i}`)) continue
+      remaining.push({
+        run: o, part: i, parts, key: `${o.runId}:${i}`,
+        start: i * partChars, end: Math.min((i + 1) * partChars, o.fullText.length),
+        cut: i === parts - 1 && total > parts,
+        len: Math.min((i + 1) * partChars, o.fullText.length) - i * partChars,
+      })
+    }
+  }
+  if (remaining.length > 0) return analyzeWave(admin, session, pool, sources, remaining, state)
   return finalizeAnalysis(admin, session, pool, sources, state)
 }
 
@@ -641,8 +676,7 @@ async function analyzeWave(
   session: SessionRow,
   pool: PoolMember[],
   sources: ArtifactRow[],
-  outputs: RunOutput[],
-  remaining: RunOutput[],
+  remaining: PartItem[],
   state: AnalysisState
 ): Promise<StepOutcome> {
   const sid = session.id
@@ -650,7 +684,7 @@ async function analyzeWave(
   // ส่วนคงที่ของ prompt (กติกา + เป้าหมาย + โครง) ใช้คำนวณว่าเหลือที่ให้ข้อมูลเท่าไรในแต่ละตัว
   const fixedTokens = estimateTokens(FINDINGS_SYSTEM_PROMPT) + estimateTokens(session.goal) + 600
 
-  const shards = planWave(remaining.map((o) => ({ o, len: o.fullText.length })), pool, fixedTokens)
+  const shards = planWave(remaining, pool, fixedTokens)
   if (shards.length === 0) {
     return {
       state: 'error',
@@ -664,11 +698,15 @@ async function analyzeWave(
 
   const results = await Promise.all(
     shards.map(async (shard, i) => {
-      const shardRuns = shard.items.map((x) => x.item.o)
+      const parts = shard.items.map((x) => x.item)
+      const items: PromptItem[] = shard.items.map((x) => ({
+        run: x.item.run, part: x.item.part, parts: x.item.parts,
+        start: x.item.start, end: Math.min(x.item.end, x.item.start + x.chars),
+        cut: x.item.cut || x.chars < x.item.len,
+      }))
       const maxOut = outputBudgetFor(shard.member.inputLimit)
       const maxFindings = Math.min(12, Math.max(3, Math.floor(maxOut / 450)))
-      const user = buildFindingsPrompt(session.goal, shardRuns, i === 0 ? uninspected : [], {
-        slices: new Map(shard.items.map((x) => [x.item.o.runId, x.chars])),
+      const user = buildFindingsPrompt(session.goal, items, i === 0 ? uninspected : [], {
         shardNote:
           `ข้อมูลนี้เป็นชุดย่อยที่ ${i + 1}/${shards.length} ของรอบนี้ — นักวิเคราะห์ท่านอื่นในทีมอ่านผลเครื่องมือส่วนที่เหลือ ` +
           'ให้สรุปเฉพาะสิ่งที่เห็นในชุดนี้ และไม่ต้องเขียนข้อจำกัดเรื่องข้อมูลที่ไม่ได้อยู่ในชุดนี้',
@@ -680,7 +718,7 @@ async function analyzeWave(
         { system: findingsSystemPrompt(maxFindings), user, maxTokens: maxOut },
         { prefer: 'large', first: shard.member }
       )
-      return { shardRuns, called }
+      return { parts, called }
     })
   )
 
@@ -691,14 +729,17 @@ async function analyzeWave(
   const parts: string[] = []
   let rejected = 0
   let findingTotal = 0
+  let doneNow = 0
   for (const r of ok) {
-    const processed = processFindings(r.called.result.value, r.shardRuns)
+    const runs = [...new Map(r.parts.map((p) => [p.run.runId, p.run])).values()]
+    const processed = processFindings(r.called.result.value, runs)
     await persistFindings(admin, sid, processed)
-    state.done.push(...r.shardRuns.map((o) => o.runId))
+    state.done.push(...r.parts.map((p) => p.key))
+    doneNow += r.parts.length
     if (Array.isArray(processed.needsMore)) state.needs_more.push(...processed.needsMore.slice(0, 5))
     rejected += processed.findings.reduce((n, f) => n + f.rejectedEvidence, 0)
     findingTotal += processed.findings.length
-    parts.push(`${r.called.agent.name} อ่าน ${r.shardRuns.length} ผล`)
+    parts.push(`${r.called.agent.name} อ่าน ${r.parts.length} ส่วน`)
   }
   state.needs_more = state.needs_more.slice(0, NEEDS_MORE_CAP)
   if (ok.length > 0) {
@@ -714,13 +755,13 @@ async function analyzeWave(
     return worst ?? { state: 'error', message: 'สรุปผลไม่สำเร็จ' }
   }
 
-  const left = remaining.length - ok.reduce((n, r) => n + r.shardRuns.length, 0)
+  const left = remaining.length - doneNow
   return {
     state: 'continue',
     message:
       `ทีมช่วยกันสรุปพร้อมกัน ${ok.length} ชุด (${parts.join(' · ')}) ได้ข้อค้นพบ ${findingTotal} รายการ` +
       (rejected ? ` (ตัดหลักฐานที่ตรวจไม่ผ่าน ${rejected})` : '') +
-      (left > 0 ? ` — เหลืออีก ${left} ผล` : '') +
+      (left > 0 ? ` — เหลืออีก ${left} ส่วน` : '') +
       (failed.length ? ` — ${failed.length} ชุดจะลองใหม่` : ''),
   }
 }
