@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { calculateCost } from '@/lib/orchestrator/pricing'
-import { InsufficientCreditError, InvalidApiKeyError, RateLimitError } from '@/lib/ai/types'
+import { InsufficientCreditError, InvalidApiKeyError, ProviderError, RateLimitError } from '@/lib/ai/types'
 import { estimateTokens } from '@/lib/orchestrator/context-budget'
 import { AnalysisFormatError, PromptTooLargeError, completeJson, type JsonCompletion } from './llm'
 import {
@@ -310,6 +310,8 @@ async function learnLimit(admin: SupabaseClient, session: SessionRow, m: PoolMem
   await saveConfig(admin, session, { agent_limits: { ...(session.config?.agent_limits ?? {}), [m.id]: next } })
 }
 
+const TRANSIENT_STATUS = new Set([500, 502, 503, 504, 529])
+
 const labelOf = (m: PoolMember) => `${m.name} · ${m.provider}/${m.model}`
 
 export async function callModel(
@@ -344,6 +346,7 @@ export async function callModel(
   let fatal: string | null = null
   let lastError: string | null = null
   let tooBig = 0
+  let transient = false
 
   for (const m of orderPool(pool, opts.prefer ?? 'lead', opts.first)) {
     const room = m.inputLimit - need // ที่เหลือให้คำตอบ (รวม headroom ของรุ่นที่คิดก่อนตอบ)
@@ -369,6 +372,10 @@ export async function callModel(
       } else if (e instanceof RateLimitError) {
         const w = Math.min(Math.max(e.retryAfterSeconds ?? 20, 5), 120)
         waitSeconds = waitSeconds === null ? w : Math.min(waitSeconds, w)
+      } else if (e instanceof ProviderError && e.status !== undefined && TRANSIENT_STATUS.has(e.status)) {
+        // provider ไม่ว่างชั่วคราว (เช่น Gemini 503 "high demand") — หายเองได้ จึงรอแล้วลองใหม่ ไม่ใช่ข้อผิดพลาดถาวร
+        transient = true
+        waitSeconds = waitSeconds === null ? 15 : Math.min(waitSeconds, 15)
       } else {
         console.error('[analysis] model call failed:', (e as Error).message)
         lastError = `เรียก AI ไม่สำเร็จ [${labelOf(m)}]: ${(e as Error).message}`
@@ -378,7 +385,10 @@ export async function callModel(
 
   // ทุกตัวในทีมพลาด — เลือกข้อความที่ช่วยผู้ใช้ตัดสินใจได้มากสุด
   if (waitSeconds !== null) {
-    return { ok: false, outcome: { state: 'waiting', message: 'โควตา AI ของทีมเต็มชั่วคราว ระบบจะลองใหม่อัตโนมัติ', retryAfterSeconds: waitSeconds } }
+    const message = transient
+      ? `AI provider ไม่ว่างชั่วคราว (503/ผู้ใช้หนาแน่น) ระบบจะลองใหม่อัตโนมัติ${pool.length < 2 ? ' — เพิ่ม agent จากค่ายอื่นในทีมเป็นตัวสำรองได้' : ''}`
+      : 'โควตา AI ของทีมเต็มชั่วคราว ระบบจะลองใหม่อัตโนมัติ'
+    return { ok: false, outcome: { state: 'waiting', message, retryAfterSeconds: waitSeconds } }
   }
   if (fatal && !lastError && tooBig === 0) {
     if (!opts.keepStatus) {
