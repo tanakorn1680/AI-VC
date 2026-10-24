@@ -43,9 +43,16 @@ export default function RunControls({
     try {
       for (let i = 0; i < MAX_STEPS_PER_RUN && !stopRef.current; i++) {
         const res = await fetch(`/api/analysis/${sessionId}/run`, { method: 'POST' })
-        const body = (await res.json().catch(() => ({}))) as StepResponse
+        const raw = await res.text().catch(() => '')
+        let body: StepResponse = {}
+        try { body = JSON.parse(raw) as StepResponse } catch { /* ตอบกลับไม่ใช่ JSON (เช่นหน้า error ของ platform) */ }
         if (!res.ok || !body.state) {
-          push(body.error ?? 'เรียกเซิร์ฟเวอร์ไม่สำเร็จ', 'error')
+          if (body.error) push(body.error, 'error')
+          else {
+            // ไม่ใช่ JSON ของระบบเรา = function ล่ม/หมดเวลา/ถูก platform ตัด — แสดงรหัสและข้อความต้นฉบับเพื่อไล่สาเหตุ
+            const snippet = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)
+            push(`เรียกเซิร์ฟเวอร์ไม่สำเร็จ (HTTP ${res.status}${snippet ? `: ${snippet}` : ''})`, 'error')
+          }
           break
         }
         router.refresh()

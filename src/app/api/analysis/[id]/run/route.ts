@@ -20,5 +20,11 @@ export async function POST(_req: Request, { params }: Ctx) {
   const { data: session } = await auth.supabase.from('analysis_sessions').select('id').eq('id', id).maybeSingle()
   if (!session) return apiError('NOT_FOUND', 'ไม่พบงานวิเคราะห์นี้')
 
-  return apiOk(await advanceSession(id, auth.user.id))
+  try {
+    return apiOk(await advanceSession(id, auth.user.id))
+  } catch (e) {
+    // ข้อผิดพลาดนอก step (เช่น สร้าง client/lease ไม่ได้) — คืน JSON พร้อมสาเหตุ แทนหน้า 500 เปล่า ๆ
+    console.error('[analysis] run route failed:', (e as Error).message)
+    return apiError('INTERNAL_ERROR', `เซิร์ฟเวอร์ผิดพลาดภายใน: ${(e as Error).message.slice(0, 160)}`)
+  }
 }

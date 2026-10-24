@@ -238,9 +238,8 @@ class LibScan {
 }
 
 // ---------- สแกนสตริงจากช่วงไบต์ ----------
-const LATIN1 = new TextDecoder('latin1')
-
 function scanStrings(b: Uint8Array, ranges: [number, number][], handle: (s: string) => void): number {
+  const LATIN1 = new TextDecoder('latin1')
   let budget = MAX_SCAN_BYTES
   for (const [start, end] of ranges) {
     const lo = Math.max(0, start)
