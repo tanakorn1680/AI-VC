@@ -17,6 +17,8 @@ export interface CompletionRequest {
    * ใช้กับ provider ที่นับ max_tokens รวมในเพดานคำขอ (เช่น Groq แพ็กเกจฟรี 8,000) — ไม่ระบุ = ไม่จำกัดเพิ่ม
    */
   outputCap?: number
+  /** เพดานเวลารอคำตอบของคำขอนี้ (มิลลิวินาที) — ไม่ระบุ = 100,000 */
+  timeoutMs?: number
 }
 
 export interface CompletionResult {
@@ -48,6 +50,13 @@ export class RateLimitError extends Error {
 export class ProviderError extends Error {
   constructor(message: string, public status?: number) {
     super(message)
+  }
+}
+
+/** โยนเมื่อ provider ตอบช้าเกินเพดานเวลา (หรือเหลือเวลาของ step ไม่พอ) — ถือเป็นปัญหาชั่วคราว status 504 */
+export class ProviderTimeoutError extends ProviderError {
+  constructor(message: string) {
+    super(message, 504)
   }
 }
 

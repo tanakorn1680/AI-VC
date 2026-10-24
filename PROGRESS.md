@@ -85,6 +85,12 @@ Multi-Agent AI Workspace — Next.js (App Router) + Supabase + Vercel, BYOK (ผ
 - `run-controls.tsx` แสดงรหัส HTTP + ข้อความต้นฉบับเมื่อเซิร์ฟเวอร์ตอบไม่ใช่ JSON (เดิมขึ้นแค่ "เรียกเซิร์ฟเวอร์ไม่สำเร็จ") และ `api/analysis/[id]/run/route.ts` ดัก exception แล้วคืน JSON — ใช้ไล่สาเหตุเมื่อ function ล่ม/หมดเวลา (ดู log ที่ Vercel)
 - ข้อจำกัด: ถ้าไลบรารีคอมไพล์ด้วย `-fno-rtti` และซ่อน symbol จะไม่เห็นชื่อคลาส (เหลือสตริงอย่างเดียว); ชื่อ C++ แบบมี substitution (`S_`) ในชื่อ scope แสดงเป็น `…`; สตริง UTF-16 ไม่ถูกสแกน
 
+### 4.7 งบเวลาต่อ step (HTTP 504 FUNCTION_INVOCATION_TIMEOUT)
+- **อาการ**: กดเริ่มงาน RE แล้วขึ้น `HTTP 504 FUNCTION_INVOCATION_TIMEOUT` — การเรียก Gemini/Anthropic/OpenAI ไม่มี timeout (เฉพาะ openai-compatible มี 100 วินาที) ถ้า provider ตอบช้า/ค้าง (เช่น Gemini หนาแน่น) ฟังก์ชันถูก Vercel ตัดที่ `maxDuration` (120 วินาที) ก่อนระบบตอบได้
+- **แก้**: `CompletionRequest.timeoutMs` (ทุก adapter ใช้ `AbortSignal.timeout`, ค่าเริ่มต้น 100 วินาที) + `ProviderTimeoutError` (504) ใน `ai/types.ts`; `completeWithRetry` รับ `deadlineAt` → จำกัดเวลาแต่ละคำขอให้จบก่อนถึงเส้นตาย, ไม่ลองซ้ำเมื่อ timeout, ไม่หน่วง retry ถ้าเลยเส้นตาย; `orchestrator.ts` ตั้งงบ step = `ANALYSIS_STEP_BUDGET_SECONDS` (ค่าเริ่มต้น 90, ต่ำกว่า maxDuration 120) ต่อ session (`stepDeadlines`), `callModel` ไม่เริ่มคำขอใหม่เมื่อเหลือ <12 วินาที (คืน `waiting` แล้วทำต่อรอบหน้า); AI ตอบช้า → ลองตัวอื่นในทีม → ไม่ได้ก็ `waiting` ไม่ใช่ error
+- ถ้าโมเดลต้องใช้เวลาเกินงบ step ทุกครั้ง (เช่นรุ่นที่คิดนานมาก) จะวนรอซ้ำ — ให้เพิ่ม agent ที่เร็วกว่าเข้าทีม หรือลดโมเดล thinking
+- ไฟล์: `ai/types.ts`, `ai/retry.ts`, `ai/gemini.ts`, `ai/anthropic.ts`, `ai/openai.ts`, `ai/openai-compatible.ts`, `analysis/llm.ts`, `analysis/orchestrator.ts`
+
 ## 5. แผนที่ไฟล์ที่เกี่ยวข้อง
 ```
 supabase/migrations/0010_shared_teams.sql      teams, agents.team_id, acquire/release_team, project_memory

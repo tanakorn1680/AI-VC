@@ -47,7 +47,7 @@ export function openaiCompatibleAdapter(
         }),
         // ไม่ตาม redirect: กัน key ถูกส่งต่อไปโฮสต์อื่น
         redirect: 'error',
-        signal: AbortSignal.timeout(100_000),
+        signal: AbortSignal.timeout(req.timeoutMs ?? 100_000),
       })
 
       if (res.status === 401 || res.status === 403) {

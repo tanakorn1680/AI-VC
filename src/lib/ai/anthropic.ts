@@ -18,6 +18,7 @@ export const anthropicAdapter: ProviderAdapter = {
   async complete(req: CompletionRequest): Promise<CompletionResult> {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
+      signal: AbortSignal.timeout(req.timeoutMs ?? 100_000),
       headers: {
         'content-type': 'application/json',
         'x-api-key': req.apiKey,

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { calculateCost } from '@/lib/orchestrator/pricing'
-import { InsufficientCreditError, InvalidApiKeyError, ProviderError, RateLimitError } from '@/lib/ai/types'
+import { InsufficientCreditError, InvalidApiKeyError, ProviderError, ProviderTimeoutError, RateLimitError } from '@/lib/ai/types'
 import { estimateTokens } from '@/lib/orchestrator/context-budget'
 import { AnalysisFormatError, PromptTooLargeError, completeJson, type JsonCompletion } from './llm'
 import {
@@ -65,6 +65,12 @@ export type StepOutcome =
   | { state: 'error'; message: string }
 
 const LOCK_SECONDS = 150
+
+// งบเวลาของหนึ่ง step (ต้องต่ำกว่า maxDuration ของ route /run = 120 วินาที ไม่งั้น platform ตัดด้วย HTTP 504)
+// ปรับได้ด้วย env ANALYSIS_STEP_BUDGET_SECONDS (เช่น 50 ถ้าแพ็กเกจ Vercel จำกัดฟังก์ชันที่ 60 วินาที ซึ่งต้องลด maxDuration ใน route ด้วย)
+const STEP_BUDGET_MS = Math.min(Math.max(Number(process.env.ANALYSIS_STEP_BUDGET_SECONDS) || 90, 20), 110) * 1000
+const MIN_CALL_MS = 12_000 // เหลือเวลาน้อยกว่านี้ไม่เริ่มเรียก AI รอบใหม่
+const stepDeadlines = new WeakMap<object, number>()
 const STALE_TASK_MS = 3 * 60 * 1000
 const MAX_EXTRA_ROUNDS = 1
 
@@ -141,6 +147,7 @@ export async function advanceSession(sessionId: string, ownerId: string): Promis
 
   const leased = await withSessionLease(admin, sessionId, async () => {
     try {
+      stepDeadlines.set(session, Date.now() + STEP_BUDGET_MS)
       return await runStep(admin, session)
     } catch (e) {
       console.error('[analysis] step crashed:', (e as Error).message)
@@ -347,8 +354,15 @@ export async function callModel(
   let lastError: string | null = null
   let tooBig = 0
   let transient = false
+  let slow = false
+  let outOfTime = false
+  const deadlineAt = stepDeadlines.get(session)
 
   for (const m of orderPool(pool, opts.prefer ?? 'lead', opts.first)) {
+    if (deadlineAt !== undefined && deadlineAt - Date.now() < MIN_CALL_MS) {
+      outOfTime = true // เวลาของ step นี้ใกล้หมด — ไม่เริ่มคำขอใหม่ (กัน HTTP 504) ทำต่อในรอบถัดไป
+      break
+    }
     const room = m.inputLimit - need // ที่เหลือให้คำตอบ (รวม headroom ของรุ่นที่คิดก่อนตอบ)
     const maxTokens = Math.min(prompt.maxTokens, m.max_tokens ?? prompt.maxTokens, room - 100)
     if (maxTokens < 1024) {
@@ -356,7 +370,7 @@ export async function callModel(
       continue
     }
     try {
-      const result = await completeJson(m, { ...prompt, maxTokens, outputCap: room })
+      const result = await completeJson(m, { ...prompt, maxTokens, outputCap: room, ...(deadlineAt !== undefined ? { deadlineAt } : {}) })
       await record(m, result.tokensIn, result.tokensOut)
       return { ok: true, result, agent: m }
     } catch (e) {
@@ -372,6 +386,10 @@ export async function callModel(
       } else if (e instanceof RateLimitError) {
         const w = Math.min(Math.max(e.retryAfterSeconds ?? 20, 5), 120)
         waitSeconds = waitSeconds === null ? w : Math.min(waitSeconds, w)
+      } else if (e instanceof ProviderTimeoutError) {
+        // AI ตอบช้าเกินเพดานเวลา/เหลือเวลาไม่พอ — ปัญหาชั่วคราว ลองตัวอื่นหรือรอแล้วทำต่อรอบหน้า
+        slow = true
+        waitSeconds = waitSeconds === null ? 5 : Math.min(waitSeconds, 5)
       } else if (e instanceof ProviderError && e.status !== undefined && TRANSIENT_STATUS.has(e.status)) {
         // provider ไม่ว่างชั่วคราว (เช่น Gemini 503 "high demand") — หายเองได้ จึงรอแล้วลองใหม่ ไม่ใช่ข้อผิดพลาดถาวร
         transient = true
@@ -384,8 +402,13 @@ export async function callModel(
   }
 
   // ทุกตัวในทีมพลาด — เลือกข้อความที่ช่วยผู้ใช้ตัดสินใจได้มากสุด
+  if (outOfTime && waitSeconds === null && !fatal) waitSeconds = 1
   if (waitSeconds !== null) {
-    const message = transient
+    const message = slow
+      ? `AI ตอบช้าเกินเวลาที่กำหนด ระบบจะลองใหม่อัตโนมัติ${pool.length < 2 ? ' — ถ้าเกิดซ้ำ ให้เพิ่ม agent ที่ตอบเร็วกว่าเป็นตัวสำรองในทีม (เช่นรุ่น flash/ไม่ใช่รุ่นที่คิดนาน)' : ''}`
+      : outOfTime && !transient
+        ? 'ใกล้หมดเวลาของ step นี้ ระบบจะทำต่อในรอบถัดไป'
+        : transient
       ? `AI provider ไม่ว่างชั่วคราว (503/ผู้ใช้หนาแน่น) ระบบจะลองใหม่อัตโนมัติ${pool.length < 2 ? ' — เพิ่ม agent จากค่ายอื่นในทีมเป็นตัวสำรองได้' : ''}`
       : 'โควตา AI ของทีมเต็มชั่วคราว ระบบจะลองใหม่อัตโนมัติ'
     return { ok: false, outcome: { state: 'waiting', message, retryAfterSeconds: waitSeconds } }

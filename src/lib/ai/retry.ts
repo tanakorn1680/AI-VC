@@ -3,6 +3,7 @@ import {
   type CompletionRequest,
   type CompletionResult,
   ProviderError,
+  ProviderTimeoutError,
   RateLimitError,
 } from './types'
 
@@ -17,7 +18,13 @@ export interface RetryOptions {
    * ใช้กับขั้นวางแผน (อยู่ในคำขอ HTTP ของผู้ใช้) — Worker ไม่ใช้ เพราะ Worker หน่วงผ่านคิวแทน
    */
   rateLimitWaitMaxSeconds?: number
+  /** เวลาสิ้นสุด (epoch ms) ของ step ที่เรียกอยู่ — ทุกคำขอถูกจำกัดเวลาให้จบก่อนถึงจุดนี้ ไม่งั้นฟังก์ชันของ platform จะถูกตัด (HTTP 504) */
+  deadlineAt?: number
 }
+
+const MIN_ATTEMPT_MS = 5_000
+const RESERVE_MS = 2_000 // กันเวลาไว้เขียนผล/ตอบกลับหลังเรียก AI เสร็จ
+const isAbort = (e: unknown) => e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')
 
 /**
  * เรียก adapter.complete พร้อม retry สั้น ๆ เมื่อเจอ error ชั่วคราวของ provider
@@ -33,9 +40,19 @@ export async function completeWithRetry(
   let rateLimitRetried = false
 
   for (let attempt = 0; ; attempt++) {
+    let attemptReq = req
+    if (opts.deadlineAt !== undefined) {
+      const remaining = opts.deadlineAt - Date.now() - RESERVE_MS
+      if (remaining < MIN_ATTEMPT_MS) throw new ProviderTimeoutError('เหลือเวลาของ step นี้ไม่พอสำหรับเรียก AI')
+      attemptReq = { ...req, timeoutMs: Math.min(req.timeoutMs ?? 100_000, remaining) }
+    }
     try {
-      return await adapter.complete(req)
+      return await adapter.complete(attemptReq)
     } catch (err) {
+      // ตอบช้าเกินเพดานเวลา: ไม่ลองซ้ำในที่เดิม (จะช้าซ้ำและกินเวลา step) ให้ผู้เรียกส่งต่อ agent อื่นหรือรอรอบถัดไป
+      if (isAbort(err)) {
+        throw new ProviderTimeoutError(`AI ตอบช้าเกิน ${Math.round((attemptReq.timeoutMs ?? 100_000) / 1000)} วินาที`)
+      }
       if (
         err instanceof RateLimitError &&
         !rateLimitRetried &&
@@ -57,7 +74,11 @@ export async function completeWithRetry(
           status
         )
       }
-      await new Promise((resolve) => setTimeout(resolve, delays[attempt]))
+      const delay = delays[attempt] as number
+      if (opts.deadlineAt !== undefined && Date.now() + delay + MIN_ATTEMPT_MS + RESERVE_MS > opts.deadlineAt) {
+        throw new ProviderError(`AI provider ไม่ว่างชั่วคราว (HTTP ${status}) ลองใหม่อีกครั้งในอีกสักครู่\n${(err as Error).message}`, status)
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay))
     }
   }
 }

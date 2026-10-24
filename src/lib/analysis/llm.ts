@@ -71,7 +71,7 @@ function extractJson(text: string): Record<string, unknown> | null {
  */
 export async function completeJson(
   analyst: AnalystAgent,
-  prompt: { system: string; user: string; maxTokens: number; outputCap?: number }
+  prompt: { system: string; user: string; maxTokens: number; outputCap?: number; deadlineAt?: number }
 ): Promise<JsonCompletion> {
   const adapter = getAdapter(analyst.provider)
   const headroom = getProviderMeta(analyst.provider)?.outputHeadroom ?? 0
@@ -96,7 +96,7 @@ export async function completeJson(
           maxTokens: currentMax,
           outputCap: cap,
           baseUrl: analyst.base_url ?? undefined,
-        })
+        }, prompt.deadlineAt !== undefined ? { deadlineAt: prompt.deadlineAt } : {})
       } catch (e) {
         const next = shrunkOnce ? null : shrunkOutputTokens(e, sentNow())
         if (next !== null) {

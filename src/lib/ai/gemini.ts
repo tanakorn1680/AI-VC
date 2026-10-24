@@ -19,6 +19,7 @@ export const geminiAdapter: ProviderAdapter = {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(req.model)}:generateContent`
     const res = await fetch(url, {
       method: 'POST',
+      signal: AbortSignal.timeout(req.timeoutMs ?? 100_000),
       headers: {
         'content-type': 'application/json',
         'x-goog-api-key': req.apiKey,
