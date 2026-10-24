@@ -70,6 +70,20 @@ Multi-Agent AI Workspace — Next.js (App Router) + Supabase + Vercel, BYOK (ผ
 - ไฟล์: `tools/zip-elf-inspect.ts`, `tools/symbol-families.ts`, `tools/elf-inspect.ts`, `tool-registry.ts`, `findings.ts` (PromptItem), `team-pool.ts` (planWave/partCharsFor), `orchestrator.ts` (analyzeStep/analyzeWave)
 - ทดสอบแล้ว: `zip-elf-inspect` กับ ZIP ที่มี .so จริง 12 ไฟล์ (self-test + ผลจริง); ยังไม่ได้ยิง AI จริง/ไม่ได้ทดสอบกับ `arm64-v8a.zip` ของผู้ใช้ (ไฟล์ .so ไม่ได้อยู่ในมือ)
 
+### 4.6 เครื่องมือ `native-strings` — แผนที่คลาส/สตริงของ .so (รอบ 4 — ไม่มี migration)
+- **เหตุผล**: ผล `zip-elf-inspect` บอกได้แค่โครงสร้าง (ไลบรารีไหนเป็นของใคร/มี JNI เท่าไร) แต่ไฟล์ถูก strip แล้ว จึงไม่รู้ว่า "ข้างในมีคลาส/ฟังก์ชันอะไร" — เครื่องมือนี้ดึงเท่าที่ยังเหลืออยู่ในไฟล์
+- **`tools/native-strings.ts`** (id `native-strings`, รับ `zip` และ `elf`): คลายทีละไฟล์ในหน่วยความจำ (เพดานเหมือน `zip-elf-inspect`, ไฟล์ใหญ่ก่อน) แล้วสรุปต่อไลบรารี:
+  - `classes` — ชื่อคลาสจาก **RTTI** (สตริง typeinfo name ใน .rodata ซึ่งอยู่ครบแม้ strip) + symbol ที่ export (vtable/typeinfo/constructor/destructor) จัดกลุ่มตาม namespace; `symbol_scopes` — ฟังก์ชันที่ export แยกตาม scope
+  - `qualified_names_in_strings` (`Class::method` ในข้อความ log/assert), `source_paths` (พาธไฟล์ซอร์สที่ฝังในสตริง จัดตามโฟลเดอร์), `java_references` (คลาส Java ที่โค้ดเรียก), `hosts`/`urls`, `file_references`
+  - `string_topics` — จัดสตริงตามคำสำคัญ 8 หัวข้อ (network, crypto, integrity, storage, formats, purchase, game, telemetry) พร้อมตัวอย่างที่สุ่มกระจายทั่วไฟล์ (heuristic ไม่ใช่การยืนยันพฤติกรรม)
+  - `import_capabilities` — ความสามารถจากชื่อฟังก์ชันที่ import จริง (socket/connect, EVP_*, ptrace/fork, dlopen ฯลฯ)
+  - บนสุดของผล: `overview` (ตารางเทียบทุกไลบรารี) + `hosts_all` (host รวม + อยู่ในไฟล์ไหน)
+- **`tools/cxx-names.ts`**: ถอดชื่อ C++ (Itanium) แบบย่อ — เอาชื่อเต็ม ไม่ถอดพารามิเตอร์ template แทนด้วย `<>`; ตรวจเทียบ `c++filt` กับ symbol จริง ~72,000 ตัว (ไบนารี node) ตรง ~68,000 ตัว ที่เหลือส่วนใหญ่เป็นกรณีที่ตั้งใจข้าม (ตัวแปร static ในฟังก์ชัน, thunk, guard variable)
+- `elf-inspect.ts` เพิ่ม `readElfNames()` (อ่านชื่อ symbol ทั้งตาราง + ช่วงสตริง; `inspectElf` เดิมไม่เปลี่ยน), `symbol-families.ts` ไม่เปลี่ยน
+- **คุมขนาดผล**: ตั้งเป้า ≤78,000 ตัวอักษร (JSON ย่อ) ต่ำกว่างบ AI ต่อ run 96,000 — ไลบรารีใหญ่ได้โควตาตัวอย่างมากกว่า ถ้าเกินงบจะลดตัวอย่างทุกไฟล์ทีละ 25% (ข้อมูลที่รวบรวมครบเสมอ ตัดตอนจัดรูป)
+- ทดสอบแล้ว: .so ที่คอมไพล์จริงด้วย g++ แล้ว `strip --strip-all` (อ่านคลาส/host/พาธซอร์ส/หัวข้อถูกต้อง); zip 22 ไฟล์ (รวม 187MB, ไลบรารีระบบ) ใช้เวลา ~5 วินาที ผล ~65k ตัวอักษร; self-test ผ่าน; **ยังไม่ได้ทดสอบกับ `arm64-v8a.zip` ของผู้ใช้และการยิง AI จริง**
+- ข้อจำกัด: ถ้าไลบรารีคอมไพล์ด้วย `-fno-rtti` และซ่อน symbol จะไม่เห็นชื่อคลาส (เหลือสตริงอย่างเดียว); ชื่อ C++ แบบมี substitution (`S_`) ในชื่อ scope แสดงเป็น `…`; สตริง UTF-16 ไม่ถูกสแกน
+
 ## 5. แผนที่ไฟล์ที่เกี่ยวข้อง
 ```
 supabase/migrations/0010_shared_teams.sql      teams, agents.team_id, acquire/release_team, project_memory
@@ -85,6 +99,7 @@ src/app/api/projects/[id]/team|memory          ทีมของโปรเจ
 src/app/(app)/team/**                          หน้าจัดการทีมทั้งหมด (/team)
 src/app/(app)/projects/[id]/                   workspace-client (แท็บ ความจำ, แบนเนอร์ทีม), agents-panel (apiBase), team-banner, memory-panel
 ```
+เครื่องมือ RE รอบ 4: `tools/native-strings.ts`, `tools/cxx-names.ts`, `tools/elf-inspect.ts` (`readElfNames`), `tool-registry.ts`
 RE ทีม (รอบ 2): `lib/analysis/team-pool.ts` (pool/เพดาน/แบ่งชุด), `team-review.ts` (ผู้ตรวจทาน), `orchestrator.ts` (callModel แบบทีม, analyzeWave, finalizeAnalysis), `llm.ts` (PromptTooLargeError, headroom-aware), `findings.ts` (prompt ชุดย่อย), `report-service.ts`, `api/analysis/[id]/route.ts` (PATCH `analyst_team_id` → config.team_id), `lib/ai/openai-compatible.ts`+`types.ts` (`outputCap`), UI `reverse-engineering/[id]/analyst-settings.tsx`+`panels.tsx`
 แก้เล็กน้อย: `lib/analysis/security.ts` + `reverse-engineering/[id]/panels.tsx` (agent ตรวจสิทธิ์ผ่านทีม), `api/projects/[id]/usage` (agent ทั้งหมดของผู้ใช้),
 `lib/utils/api.ts` (+`CONFLICT` 409), `lib/supabase/middleware.ts` (+`/team`)
@@ -113,6 +128,8 @@ RE ทีม (รอบ 2): `lib/analysis/team-pool.ts` (pool/เพดาน/�
 - RE: เพดานเริ่มต้นของ Groq ตั้งไว้ 6–8k (แพ็กเกจจ่ายเงินสูงกว่านั้น แต่ระบบไม่ปรับขึ้นเอง) — ถ้าต้องการ ให้เพิ่มช่องตั้ง "เพดานคำขอ" ต่อ agent
 - RE: ZIP ที่ใหญ่เกิน 25MB (`MAX_ARTIFACT_BYTES`) อัปโหลดไม่ได้ และ .so เดี่ยวใน ZIP ที่เกิน 64MB ถูกข้าม (เช่น `libsimcity.so` 37MB ผ่าน)
 - RE: ผู้ตรวจทานตรวจได้ ≤40 ข้อค้นพบต่อรอบ และถ้าทั้งทีมเล็กเกินจะข้ามรีวิว; spec/report (`report-service.ts`) ยังเรียกตัวเดียว (เลือกตัวใหญ่สุด) ไม่แบ่งชุด
+- RE: งานที่ completed แล้วจะไม่วางแผนใหม่ — ถ้าเพิ่มเครื่องมือใหม่ (เช่น `native-strings`) ต้องเริ่ม session ใหม่ (ไอเดีย: ปุ่ม "วางแผนใหม่/ตรวจเพิ่มด้วยเครื่องมือใหม่")
+- RE: `native-strings` ยังไม่ถอด string UTF-16 และไม่ดึงข้อมูลจาก .dex/ไฟล์ที่ไม่ใช่ ELF ใน ZIP
 - `analyst_agent_id` ยังอยู่ใน DB/API เพื่อความเข้ากันได้ย้อนหลัง แต่ UI ไม่ใช้แล้ว
 
 ## 9. ข้อควรระวัง

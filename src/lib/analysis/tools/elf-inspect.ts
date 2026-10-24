@@ -400,6 +400,103 @@ export function inspectElf(input: ToolInput): ToolResult {
   }
 }
 
+export interface ElfNames {
+  machine: string
+  is64: boolean
+  stripped: boolean | null
+  hasSections: boolean
+  soname: string
+  /** ชื่อ symbol ที่ export แบบ dynamic (ครบทั้งตาราง ไม่ตัด) */
+  exports: string[]
+  /** ชื่อ symbol ที่ import แบบ dynamic */
+  imports: string[]
+  /** ฟังก์ชัน/ตัวแปรที่นิยามใน .symtab (มีเมื่อไฟล์ไม่ถูก strip) */
+  locals: string[]
+  /** ช่วงไบต์ของส่วนข้อมูลแบบอ่านอย่างเดียวที่ควรสแกนสตริง (.rodata/.data*) */
+  stringRanges: [number, number][]
+  notes: string[]
+}
+
+/**
+ * อ่านเฉพาะ "รายชื่อทั้งหมด" ที่เครื่องมืออื่นต้องใช้ (symbol ที่ export/import ครบทุกตัว + ช่วงข้อมูลสำหรับสแกนสตริง)
+ * แยกจาก inspectElf เพราะ inspectElf ตัดรายการไว้ที่ไม่กี่ร้อยตัวเพื่อให้ผลลัพธ์กระชับ
+ */
+export function readElfNames(b: Uint8Array): ElfNames {
+  if (b.length < 52 || b[0] !== 0x7f || b[1] !== 0x45 || b[2] !== 0x4c || b[3] !== 0x46) {
+    throw new ElfFormatError('ไม่ใช่ไฟล์ ELF (ไม่พบ magic bytes)')
+  }
+  const cls = b[4], data = b[5]
+  if ((cls !== 1 && cls !== 2) || (data !== 1 && data !== 2)) throw new ElfFormatError('ELF header ไม่ถูกต้อง (class/endianness)')
+  const r = new Reader(b, cls === 2, data === 1)
+  const notes: string[] = []
+  try {
+    const machine = r.u16(18)
+    const phoff = r.is64 ? r.u64(32) : r.u32(28)
+    const shoff = r.is64 ? r.u64(40) : r.u32(32)
+    const phentsize = r.is64 ? r.u16(54) : r.u16(42)
+    const phnum = r.is64 ? r.u16(56) : r.u16(44)
+    const shentsize = r.is64 ? r.u16(58) : r.u16(46)
+    let shnum = r.is64 ? r.u16(60) : r.u16(48)
+    let shstrndx = r.is64 ? r.u16(62) : r.u16(50)
+    if (shnum === 0 && shoff > 0 && shoff + shentsize <= b.length) shnum = r.is64 ? r.u64(shoff + 32) : r.u32(shoff + 20)
+    if (shstrndx === 0xffff && shoff > 0 && shoff + shentsize <= b.length) shstrndx = r.is64 ? r.u32(shoff + 40) : r.u32(shoff + 24)
+    if (shnum > 65535) throw new ElfFormatError('จำนวน section ผิดปกติ')
+
+    const phdrs = phnum > 0 && phoff > 0 ? readPhdrs(r, phoff, phnum, phentsize) : []
+    const hasSections = shnum > 0 && shoff > 0 && shentsize >= (r.is64 ? 64 : 40)
+    const sections = hasSections ? readSections(r, shoff, shnum, shentsize, shstrndx) : []
+    if (!hasSections) notes.push('ไฟล์ไม่มี section header จึงอ่านตาราง symbol ไม่ได้ สแกนสตริงจาก program header แทน')
+
+    const dynsymSec = sections.find((s) => s.type === SHT.DYNSYM)
+    const symtabSec = sections.find((s) => s.type === SHT.SYMTAB)
+    const dynRes = dynsymSec ? readSymbols(r, dynsymSec, sections[dynsymSec.link]) : { syms: [] as Sym[], truncated: false }
+    if (dynRes.truncated) notes.push(`ตาราง dynamic symbol ใหญ่เกิน ${MAX_SYMBOL_ROWS} แถว อ่านเฉพาะส่วนต้น`)
+    const imports = dynRes.syms.filter((s) => s.shndx === 0 && s.name).map((s) => s.name)
+    const exports = dynRes.syms.filter((s) => s.shndx !== 0 && (s.bind === 1 || s.bind === 2) && s.name && s.type !== 4).map((s) => s.name)
+    let locals: string[] = []
+    if (symtabSec) {
+      const res = readSymbols(r, symtabSec, sections[symtabSec.link])
+      locals = res.syms.filter((s) => (s.type === 1 || s.type === 2) && s.shndx !== 0 && s.name).map((s) => s.name)
+      if (res.truncated) notes.push(`ตาราง .symtab ใหญ่เกิน ${MAX_SYMBOL_ROWS} แถว อ่านเฉพาะส่วนต้น`)
+    }
+
+    let soname = ''
+    const dynSec = sections.find((s) => s.type === SHT.DYNAMIC)
+    if (dynSec) {
+      const str = sections[dynSec.link]
+      if (str) soname = parseDynamic(r, dynSec.offset, dynSec.size, (v) => str.offset + v).soname
+    }
+
+    let stringRanges: [number, number][]
+    if (hasSections) {
+      stringRanges = sections
+        .filter((s) => s.type === SHT.PROGBITS && (s.flags & SHF_ALLOC) !== 0 && (s.flags & SHF_EXEC) === 0 && (s.name.startsWith('.rodata') || s.name.startsWith('.data')))
+        .map((s) => [s.offset, s.offset + s.size] as [number, number])
+    } else {
+      stringRanges = phdrs.filter((p) => p.type === 1 && (p.flags & 1) === 0).map((p) => [p.offset, p.offset + p.filesz] as [number, number])
+    }
+    if (stringRanges.length === 0) {
+      stringRanges = [[0, b.length]]
+      notes.push('ไม่พบส่วนข้อมูลแบบอ่านอย่างเดียว จึงสแกนทั้งไฟล์ (อาจมีสตริงปะปนจากส่วนโค้ด)')
+    }
+    return {
+      machine: `${MACHINES[machine] ?? `0x${machine.toString(16)}`} ${r.is64 ? '64-bit' : '32-bit'}`,
+      is64: r.is64,
+      stripped: hasSections ? !symtabSec : null,
+      hasSections,
+      soname,
+      exports,
+      imports,
+      locals,
+      stringRanges,
+      notes,
+    }
+  } catch (e) {
+    if (e instanceof ElfFormatError) throw e
+    throw new ElfFormatError('โครงสร้างของไฟล์ ELF เสียหายหรือถูกตัด จึงอ่านต่อไม่ได้')
+  }
+}
+
 // ---------- ELF ตัวอย่างขนาดเล็กสำหรับ self-test (สร้างในหน่วยความจำ ทั้ง 32 และ 64 บิต) ----------
 export function buildSampleElf(is64: boolean): Uint8Array {
   const enc = new TextEncoder()
